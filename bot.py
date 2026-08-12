@@ -175,6 +175,55 @@ def _simple_cmd(command_name: str, cmd_type: CommandType, beeps: int = 0):
     return handler
 
 
+def _door_locked(car, door: str = "driver") -> bool | None:
+    """Whether a door is locked, None if unknown. door: "driver" or "trunk"."""
+    doors = car.lock_status.doors if car.lock_status else None
+    if doors is None:
+        return None
+    d = doors.driver_seat if door == "driver" else doors.trunk
+    return d.locked if d else None
+
+
+async def _verify_lock(car, target: str, before_locked: bool | None,
+                       door: str = "driver",
+                       attempts: int = 6, delay: float = 5.0):
+    """Wait for the car to confirm a lock/unlock command.
+
+    ``return_code == "000000"`` on the command only means the server accepted
+    the request; the real outcome shows up in the lock status reads. Polls the
+    selected door's lock state until it matches the target.
+
+    Returns ``(outcome, observed_locked)`` with outcome one of ``"ok"`` /
+    ``"already"`` (was already in the target state) / ``"timeout"``.
+    """
+    want = target == "locked"
+    for _ in range(attempts):
+        try:
+            await car.update(only=["status"])
+        except Exception:
+            await asyncio.sleep(delay)
+            continue
+        current = _door_locked(car, door)
+        if current == want:
+            if before_locked is None or before_locked != want:
+                return "ok", current
+            return "already", current
+        await asyncio.sleep(delay)
+    return "timeout", _door_locked(car, door)
+
+
+def _lock_outcome_text(target: str, outcome: str, noun: str = "doors"):
+    verb = "locked" if target == "locked" else "unlocked"
+    if outcome == "ok":
+        return f"{noun.capitalize()} {verb} (confirmed by the car)."
+    if outcome == "already":
+        return f"The {noun} were already {verb}."
+    return (
+        f"The car did not confirm that the {noun} were {verb}. "
+        "Check the app."
+    )
+
+
 # ── Keyboard ────────────────────────────────────────────────────────────
 
 
@@ -887,12 +936,43 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Remote command handlers ──────────────────────────────────────────
 
 
-cmd_lock = _simple_cmd("Lock doors", CommandType.DOOR_LOCK)
-cmd_unlock = _simple_cmd("Unlock doors", CommandType.DOOR_UNLOCK)
+def _lock_cmd(command_name: str, cmd_type: CommandType, target: str,
+              door: str = "driver", noun: str = "doors"):
+    """Handler for lock/unlock that waits for vehicle confirmation."""
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = check_allowed(update)
+        if uid:
+            return await update.message.reply_text(f"Access denied. Your ID: {uid}")
+        msg = await update.message.reply_text(f"{command_name}...")
+        try:
+            await ensure_client()
+            car = (await client.get_vehicles())[0]
+            before = _door_locked(car, door)
+            result = await car.post_command(cmd_type)
+            payload = getattr(result, "payload", None)
+            rc = getattr(payload, "return_code", None) or getattr(payload, "returnCode", None)
+            if rc and rc != "000000":
+                return await msg.edit_text(f"{command_name} failed (return code {rc}).")
+            await msg.edit_text(
+                f"{command_name} — waiting for the car to confirm (up to ~30 s)..."
+            )
+            outcome, _ = await _verify_lock(car, target, before, door)
+            await msg.edit_text(
+                f"{command_name}: {_lock_outcome_text(target, outcome, noun)}"
+            )
+        except Exception as e:
+            await msg.edit_text(f"Error: {e}")
+    return handler
+
+
+cmd_lock = _lock_cmd("Lock doors", CommandType.DOOR_LOCK, "locked")
+cmd_unlock = _lock_cmd("Unlock doors", CommandType.DOOR_UNLOCK, "unlocked")
 cmd_hazards_on = _simple_cmd("Hazards on", CommandType.HAZARD_ON)
 cmd_hazards_off = _simple_cmd("Hazards off", CommandType.HAZARD_OFF)
-cmd_trunk_lock = _simple_cmd("Trunk lock", CommandType.TRUNK_LOCK)
-cmd_trunk_unlock = _simple_cmd("Trunk unlock", CommandType.TRUNK_UNLOCK)
+cmd_trunk_lock = _lock_cmd("Trunk lock", CommandType.TRUNK_LOCK, "locked",
+                           door="trunk", noun="trunk")
+cmd_trunk_unlock = _lock_cmd("Trunk unlock", CommandType.TRUNK_UNLOCK, "unlocked",
+                             door="trunk", noun="trunk")
 cmd_buzzer = _simple_cmd("Buzzer warning", CommandType.BUZZER_WARNING)
 
 
