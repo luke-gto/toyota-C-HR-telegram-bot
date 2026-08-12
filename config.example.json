@@ -1,0 +1,16 @@
+{
+    "toyota": {
+        "username": "your@email.com",
+        "password": "yourpassword",
+        "brand": "T"
+    },
+    "telegram": {
+        "token": "YOUR_BOT_TOKEN_HERE"
+    },
+    "allowed_user_ids": [],
+    "battery": {
+        "phev_ev_display": true,
+        "soc_buffer": 31.0,
+        "soc_factor": 1.3333
+    }
+}
