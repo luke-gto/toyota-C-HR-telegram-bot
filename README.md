@@ -60,6 +60,21 @@ python3 -m venv .venv
 .venv/bin/python bot.py
 ```
 
+### Uninstall
+
+To remove the bot once installed via `./install.sh`:
+
+```bash
+./uninstall.sh                 # stop/disable service, remove service file, keep config/data/venv
+./uninstall.sh --purge -y      # full cleanup: also remove .venv, config.json and data/
+./uninstall.sh --remove-data   # remove service + data/ only
+```
+
+Options: `--purge`, `--keep-venv`, `--remove-config`, `--remove-data`, `--disable-linger`, `-y/--yes` non-interactive, `-h/--help`.
+
+- Handles both the systemd **user** service (`~/.config/systemd/user/toyota-bot.service`) and the **system** service (`/etc/systemd/system/toyota-bot.service`).
+- By default keeps `config.json` (Toyota/Telegram secrets) and `data/`; use `--purge` to delete them.
+
 ## Configuration (`config.json`)
 
 ```json
