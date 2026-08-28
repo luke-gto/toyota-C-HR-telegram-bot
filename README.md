@@ -18,8 +18,9 @@ see trips and driving scores, and receive app notifications.
 - Reads live vehicle data: fuel level, HV battery, EV/fuel range, odometer, charging status
 - Reads door/window/hood lock status and the last parked location
 - Reads warning lights, engine-oil status and service history
+- Checks for **anomalies** (dashboard warnings + vehicle status warnings) via `/anomalies` button
 - Reads trips, driving scores and consumption summaries
-- Sends remote commands: lock/unlock, hazards, trunk, buzzer, climate, charging
+- Sends remote commands: lock/unlock, hazards, trunk, buzzer, climate (with auto-off notice), charging
 - Polls the app's notification feed every 5 minutes and forwards new ones to your chat
 - Works from a **keyboard** — no need to type commands
 
@@ -71,7 +72,7 @@ python3 -m venv .venv
     "telegram": {
         "token": "YOUR_BOT_TOKEN_HERE"
     },
-    "allowed_user_ids": [],
+    "allowed_user_ids": [123456789],
     "battery": {
         "phev_ev_display": true,
         "soc_buffer": 31.0,
@@ -80,12 +81,14 @@ python3 -m venv .venv
 }
 ```
 
+> **🔒 Security & privacy:** The bot **will not start** if `allowed_user_ids` is missing or empty. This is intentional — without an allowlist anyone who discovers your bot username could query your car's location, fuel, lock status and send remote commands. Set at least one Telegram user ID (see step 7 below). The check happens at startup (`bot.py:44`) and the process exits with `Refusing to start: 'allowed_user_ids' is missing or empty` — add your ID to `config.json` and restart.
+
 | Key | Description |
 | --- | ----------- |
 | `toyota.username` / `toyota.password` | Your Toyota Connected Services account login |
 | `toyota.brand` | `"T"` for Toyota, `"L"` for Lexus |
 | `telegram.token` | The bot token given by @BotFather (see below) |
-| `allowed_user_ids` | List of Telegram user IDs allowed to use the bot. Leave empty to allow everyone (not recommended) |
+| `allowed_user_ids` | **Required.** List of Telegram user IDs allowed to use the bot. The bot **refuses to start** if this is missing or `[]` (security/privacy — prevents open access to your vehicle). Add at least one ID from @userinfobot. |
 | `battery` | PHEV battery display calibration (see "Battery charge display" below) |
 
 ## Telegram bot commands
@@ -102,6 +105,7 @@ python3 -m venv .venv
 | `/climate_status` | AC state and target temperature |
 | `/location` | Last parked location (Google Maps link) |
 | `/health` | Warning lights and engine-oil status |
+| `/anomalies` | Check for anomalies (combines health warnings + vehicle status `overall_warning_counts`) |
 | `/service_history` | Dealer visits |
 | `/trips [n]` | Total km driven `n` days ago (`0` = today, `1` = yesterday, ...) |
 | `/trip` | Alias for `/trips` |
@@ -124,9 +128,9 @@ python3 -m venv .venv
 
 | Command | Description |
 | ------- | ----------- |
-| `/ac_on` | Start AC (asks for a temperature between 14 and 29°C) |
+| `/ac_on` | Start AC (asks for a temperature between 14 and 29°C, auto-off after 20 min — bot replies with shut-off time) |
 | `/ac_off` | Stop AC |
-| `/climate <temp>` | Set the target temperature (14–29°C) and start |
+| `/climate <temp>` | Set the target temperature (14–29°C) and start (auto-off after 20 min — bot replies with shut-off time) |
 | `/refresh_climate` | Refresh the climate status |
 
 *Battery / charging*

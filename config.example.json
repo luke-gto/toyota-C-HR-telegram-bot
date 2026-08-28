@@ -7,7 +7,7 @@
     "telegram": {
         "token": "YOUR_BOT_TOKEN_HERE"
     },
-    "allowed_user_ids": [],
+    "allowed_user_ids": [123456789],
     "battery": {
         "phev_ev_display": true,
         "soc_buffer": 31.0,

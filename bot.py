@@ -41,7 +41,13 @@ with open(CONFIG_FILE) as f:
 
 TOYOTA_CFG = config["toyota"]
 TOKEN = config["telegram"]["token"]
-ALLOWED_USERS = config.get("allowed_user_ids", [])
+ALLOWED_USERS = config.get("allowed_user_ids")
+if not isinstance(ALLOWED_USERS, list) or len(ALLOWED_USERS) == 0:
+    logger.error(
+        "Refusing to start: 'allowed_user_ids' is missing or empty in config.json "
+        "— set at least one allowed Telegram user ID."
+    )
+    sys.exit(1)
 
 TEMP_WAIT = 1
 PERIOD_WAIT = 2
@@ -68,7 +74,7 @@ def save_data(data):
 
 def check_allowed(update: Update) -> int | None:
     uid = update.effective_user.id
-    if ALLOWED_USERS and uid not in ALLOWED_USERS:
+    if uid not in ALLOWED_USERS:
         return uid
     return None
 
@@ -242,6 +248,7 @@ BUTTONS = [
     ("Unlock", "unlock"),
     ("Buzzer", "buzzer"),
     ("Service history", "service_history"),
+    ("Anomalies", "anomalies"),
     ("Trips today", "trips"),
     ("Trips summary", None),
     ("Last trip", "last_trip"),
@@ -289,6 +296,7 @@ HELP_TEXT = (
     "/climate_status  — AC state & target\n"
     "/location  — last parked location\n"
     "/health  — warning lights, oil\n"
+    "/anomalies  — check for anomalies (warnings)\n"
     "/service_history  — dealer visits\n"
     "/trips [n]  — km driven n days ago (0 = today)\n"
     "/trip  — alias for /trips\n"
@@ -304,9 +312,9 @@ HELP_TEXT = (
     "/trunk_lock  /trunk_unlock\n"
     "/buzzer  — buzzer warning\n\n"
     "Climate\n"
-    "/ac_on  — start AC (asks temp)\n"
+    "/ac_on  — start AC (asks temp, auto-off in 20 min)\n"
     "/ac_off  — stop AC\n"
-    "/climate <temp>  — set target temp\n"
+    "/climate <temp>  — set target temp (auto-off in 20 min)\n"
     "/refresh_climate  — refresh status\n\n"
     "Battery / Charging\n"
     "/charge_now  — charge immediately\n"
@@ -643,6 +651,80 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ts.tzinfo is not None:
                 ts = ts.astimezone()
             lines.append(f"_{ts.strftime('%d/%m %H:%M')}_")
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"Error: {e}")
+
+
+async def cmd_anomalies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = check_allowed(update)
+    if uid:
+        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
+    msg = await update.message.reply_text("Checking for anomalies...")
+    try:
+        await ensure_client()
+        api = client._api
+        # Fetch health and status in parallel — both carry anomaly signals
+        health, remote_status = await asyncio.gather(
+            api.get_vehicle_health_status(vin),
+            api.get_remote_status(vin),
+        )
+        try:
+            car = (await client.get_vehicles())[0]
+            title = car.alias or "C-HR"
+        except Exception:
+            title = "Vehicle"
+        lines = [f"*{title}* — anomalies"]
+
+        has_anomaly = False
+        details: list[str] = []
+
+        # 1) Health — dashboard warning lights
+        if health and health.payload:
+            warnings = health.payload.warning or []
+            if warnings:
+                has_anomaly = True
+                details.append(f"⚠️ Dashboard warnings: {len(warnings)}")
+                for w in warnings[:10]:
+                    details.append(f"  • {_health_item_text(w)}")
+            oil = health.payload.quantity_of_eng_oil_icon or []
+            # quantityOfEngOilIcon is present only when oil needs attention
+            if oil:
+                has_anomaly = True
+                details.append("⚠️ Engine oil: " + ", ".join(map(_health_item_text, oil)))
+            # timestamp
+            ts = health.payload.wng_last_upd_time
+            if ts:
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone()
+                details.append(f"_Health updated: {ts.strftime('%d/%m %H:%M')}_")
+
+        # 2) Remote status — overall warning counts / status
+        if remote_status and remote_status.payload:
+            p = remote_status.payload
+            count = p.overall_warning_counts
+            overall = p.overall_status
+            if count is not None and count > 0:
+                has_anomaly = True
+                details.append(f"⚠️ Vehicle status warnings: {count} (overall: {overall or '?'})")
+            elif overall and overall.lower() not in ("ok", "normal", "no_warning", ""):
+                # Some vehicles report overall_status != ok even with count 0
+                has_anomaly = True
+                details.append(f"⚠️ Overall status: {overall}")
+            if p.last_update_timestamp:
+                ts2 = p.last_update_timestamp
+                if ts2.tzinfo is not None:
+                    ts2 = ts2.astimezone()
+                details.append(f"_Status updated: {ts2.strftime('%d/%m %H:%M')}_")
+
+        if not has_anomaly:
+            lines.append("✅ No anomalies detected — all systems normal.")
+            if details:
+                lines.extend(details)
+        else:
+            lines.append("Anomalies found:")
+            lines.extend(details)
+
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"Error: {e}")
@@ -1088,7 +1170,22 @@ async def _verify_climate(api, action: str, before_started=None,
 def _climate_outcome_text(action, temp, outcome, state, started):
     if action == "start":
         if outcome == "ok":
-            return f"AC set to {temp}°C and started (confirmed by the car)."
+            # AC auto-offs after 20 min — tell the user when
+            try:
+                if started and getattr(started, "tzinfo", None):
+                    base = started.astimezone()
+                elif started:
+                    base = started
+                else:
+                    base = datetime.now().astimezone()
+                off = base + timedelta(minutes=20)
+                off_str = off.strftime("%H:%M %d/%m")
+                return (
+                    f"AC set to {temp}°C and started (confirmed by the car). "
+                    f"Will auto-off at {off_str} (~20 min)."
+                )
+            except Exception:
+                return f"AC set to {temp}°C and started (confirmed by the car). Will auto-off in ~20 min."
         if outcome == "already":
             when = started.strftime("%d/%m %H:%M") if started else "earlier"
             return (
@@ -1364,7 +1461,7 @@ HANDLERS = {
     "start": cmd_start, "help": cmd_help,
     "vehicles": cmd_vehicles, "status": cmd_status, "charge": cmd_charge,
     "lock_status": cmd_lock_status, "climate_status": cmd_climate_status,
-    "location": cmd_location, "health": cmd_health,
+    "location": cmd_location, "health": cmd_health, "anomalies": cmd_anomalies,
     "service_history": cmd_service_history, "trips": cmd_trips,
     "last_trip": cmd_last_trip, "scores": cmd_scores, "summary": cmd_summary,
     "notifications": cmd_notifications, "lock": cmd_lock, "unlock": cmd_unlock,
@@ -1381,6 +1478,12 @@ BUTTON_HANDLERS = {label: HANDLERS[cmd] for label, cmd in BUTTONS if cmd}
 
 
 def main():
+    if not isinstance(ALLOWED_USERS, list) or len(ALLOWED_USERS) == 0:
+        logger.error(
+            "Refusing to start: 'allowed_user_ids' is missing or empty in config.json "
+            "— set at least one allowed Telegram user ID."
+        )
+        sys.exit(1)
     app = (
         Application.builder().token(TOKEN).post_init(post_init).build()
     )
@@ -1449,6 +1552,7 @@ def main():
     app.add_handler(CommandHandler("climate_status", cmd_climate_status))
     app.add_handler(CommandHandler("location", cmd_location))
     app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("anomalies", cmd_anomalies))
     app.add_handler(CommandHandler("service_history", cmd_service_history))
     app.add_handler(CommandHandler("trips", cmd_trips))
     app.add_handler(CommandHandler("trip", cmd_trips))
