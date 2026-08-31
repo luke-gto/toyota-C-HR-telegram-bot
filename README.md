@@ -104,6 +104,7 @@ Options: `--purge`, `--keep-venv`, `--remove-config`, `--remove-data`, `--disabl
 | `toyota.brand` | `"T"` for Toyota, `"L"` for Lexus |
 | `telegram.token` | The bot token given by @BotFather (see below) |
 | `allowed_user_ids` | **Required.** List of Telegram user IDs allowed to use the bot. The bot **refuses to start** if this is missing or `[]` (security/privacy — prevents open access to your vehicle). Add at least one ID from @userinfobot. |
+| `timezone` | *Optional.* IANA timezone override (e.g. `"Europe/Rome"`) for every time the bot shows. Normally not needed — the bot auto-detects the timezone, see "Timezone" below. |
 | `battery` | PHEV battery display calibration (see "Battery charge display" below) |
 
 ## Telegram bot commands
@@ -143,9 +144,9 @@ Options: `--purge`, `--keep-venv`, `--remove-config`, `--remove-data`, `--disabl
 
 | Command | Description |
 | ------- | ----------- |
-| `/ac_on` | Start AC (asks for a temperature between 14 and 29°C, auto-off after 20 min — bot replies with shut-off time) |
+| `/ac_on` | Start AC (asks for a temperature between 18 and 29°C, auto-off after 20 min — bot replies with shut-off time) |
 | `/ac_off` | Stop AC |
-| `/climate <temp>` | Set the target temperature (14–29°C) and start (auto-off after 20 min — bot replies with shut-off time) |
+| `/climate <temp>` | Set the target temperature (18–29°C) and start (auto-off after 20 min — bot replies with shut-off time) |
 | `/refresh_climate` | Refresh the climate status |
 
 *Battery / charging*
@@ -161,6 +162,7 @@ Options: `--purge`, `--keep-venv`, `--remove-config`, `--remove-data`, `--disabl
 | ------- | ----------- |
 | `/wake` | Wake the vehicle |
 | `/alias <name>` | Set a nickname for the vehicle |
+| `/timezone` | Set the bot's timezone: share your location or type an IANA name (stored in `data/data.json`, see "Timezone" below) |
 | `/notify` | Send app notifications to this chat |
 | `/unotify` | Stop sending notifications to this chat |
 | `/cancel` | Cancel the current prompt |
@@ -211,6 +213,27 @@ button, so you never have to type `/command`. Buttons that need input (`AC On`,
    ```bash
    systemctl --user restart toyota-bot   # if installed with ./install.sh
    ```
+
+## Timezone
+
+The Toyota API returns UTC timestamps, so the bot converts every time it shows to a
+single display timezone, resolved in this order:
+
+1. `timezone` in `config.json` — optional override, wins over everything else.
+2. The timezone saved in `data/data.json` via `/timezone` (or the *Set timezone* button).
+3. The server's system timezone (auto-detected with `tzlocal`).
+
+On a machine with the correct local timezone (e.g. `Europe/Rome`) no setup is needed.
+
+`/timezone` starts a small conversation: share your location with the one-time button
+(the coordinates are converted to a timezone **offline** with
+[`timezonefinder`](https://github.com/jannikmi/timezonefinder) and never leave the
+machine), or type a timezone name like `Europe/Rome`. Location buttons only work in a
+private chat — in groups, type the name instead.
+
+If the bot runs where the system timezone is wrong (a UTC server or Docker container),
+either set `timezone` in `config.json` or use `/timezone` once — the choice persists in
+`data/data.json` across restarts.
 
 ## Battery charge display (PHEV) — known issue and fix
 

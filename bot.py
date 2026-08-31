@@ -3,8 +3,10 @@ import asyncio
 import calendar
 import json
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from typing import overload
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -22,7 +24,7 @@ from pytoyoda.models.endpoints.electric import (
     NextChargeSettings,
 )
 from pytoyoda.models.summary import SummaryType
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,6 +33,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from timezonefinder import TimezoneFinder
+from tzlocal import get_localzone_name
 
 HERE = Path(__file__).parent
 CONFIG_FILE = HERE / "config.json"
@@ -53,6 +57,10 @@ TEMP_WAIT = 1
 PERIOD_WAIT = 2
 DAY_WAIT = 3
 MONTH_WAIT = 4
+TZ_WAIT = 5
+
+TEMP_MIN = 18
+TEMP_MAX = 29
 
 client: MyT | None = None
 vin: str | None = None
@@ -72,11 +80,64 @@ def save_data(data):
     DATA_FILE.write_text(json.dumps(data, indent=2, default=str))
 
 
+def _resolve_timezone() -> tuple[tzinfo, str]:
+    """Pick the display timezone: config.json > data.json (/timezone) > system."""
+    candidates = [
+        ("config.json", config.get("timezone")),
+        ("data/data.json, set via /timezone", load_data().get("timezone")),
+    ]
+    try:
+        candidates.append(("system", get_localzone_name()))
+    except Exception:
+        pass
+    for source, name in candidates:
+        if not name:
+            continue
+        try:
+            return ZoneInfo(name), source
+        except Exception:
+            logger.error(f"Ignoring invalid timezone {name!r} from {source}")
+    logger.warning("No usable timezone found, using the fixed local UTC offset")
+    return datetime.now().astimezone().tzinfo or timezone.utc, "fixed local offset"
+
+
+USER_TZ, TZ_SOURCE = _resolve_timezone()
+logger.info(f"Using timezone {USER_TZ} ({TZ_SOURCE})")
+
+_tz_finder: TimezoneFinder | None = None
+
+
+def _find_timezone(lat: float, lng: float) -> str | None:
+    global _tz_finder
+    finder = _tz_finder
+    if finder is None:
+        finder = TimezoneFinder()
+        _tz_finder = finder
+    return finder.timezone_at(lat=lat, lng=lng)
+
+
 def check_allowed(update: Update) -> int | None:
     uid = update.effective_user.id
     if uid not in ALLOWED_USERS:
         return uid
     return None
+
+
+@overload
+def user_dt(dt: datetime) -> datetime: ...
+@overload
+def user_dt(dt: None) -> None: ...
+def user_dt(dt: datetime | None) -> datetime | None:
+    """Convert an API timestamp (UTC, naive or aware) to the user's timezone."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(USER_TZ)
+
+
+def _today() -> date:
+    return datetime.now(USER_TZ).date()
 
 
 async def ensure_client():
@@ -262,6 +323,7 @@ BUTTONS = [
     ("Charge now", "charge_now"),
     ("Refresh battery", "refresh_battery"),
     ("Wake", "wake"),
+    ("Set timezone", None),
     ("Notify", "notify"),
     ("Stop notify", "unotify"),
     ("Help", "help"),
@@ -322,6 +384,7 @@ HELP_TEXT = (
     "System\n"
     "/wake  — wake vehicle\n"
     "/alias <name>  — set nickname\n"
+    "/timezone  — set the bot's timezone (share location or type a name)\n"
     "/notify  — push notifications here\n"
     "/unotify  — stop notifications\n\n"
     "Tap the buttons below to run commands without typing."
@@ -415,7 +478,7 @@ async def cmd_lock_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if wlines:
                 lines.append(f"• Windows: {', '.join(wlines)}")
         if ls.last_updated:
-            lines.append(f"_{ls.last_updated.strftime('%d/%m %H:%M')}_")
+            lines.append(f"_{user_dt(ls.last_updated).strftime('%d/%m %H:%M')}_")
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"Error: {e}")
@@ -528,7 +591,8 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         next_ev = getattr(payload, "next_charging_event", None) if payload else None
         if next_ev and next_ev.timestamp:
             lines.append(
-                f"Next charge: {next_ev.event_type} {next_ev.timestamp.strftime('%d/%m %H:%M')}"
+                f"Next charge: {next_ev.event_type} "
+                f"{user_dt(next_ev.timestamp).strftime('%d/%m %H:%M')}"
             )
         schedules = getattr(payload, "charging_schedules", None) if payload else None
         if schedules:
@@ -569,7 +633,7 @@ async def cmd_climate_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if p.duration:
                 lines.append(f"Duration: {p.duration} min")
             if p.started_at:
-                lines.append(f"Started: {p.started_at:%d/%m %H:%M}")
+                lines.append(f"Started: {user_dt(p.started_at):%d/%m %H:%M}")
             if p.current_temperature:
                 cur = p.current_temperature
                 lines.append(f"Cabin: {cur.value}°{cur.unit}")
@@ -605,7 +669,7 @@ async def cmd_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if loc.state:
             text += f"\n{loc.state}"
         if loc.timestamp:
-            text += f"\n_{loc.timestamp.strftime('%d/%m %H:%M')}_"
+            text += f"\n_{user_dt(loc.timestamp).strftime('%d/%m %H:%M')}_"
         await msg.edit_text(text, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         await msg.edit_text(f"Error: {e}")
@@ -647,10 +711,7 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append("Engine oil: OK")
         if p.wng_last_upd_time:
-            ts = p.wng_last_upd_time
-            if ts.tzinfo is not None:
-                ts = ts.astimezone()
-            lines.append(f"_{ts.strftime('%d/%m %H:%M')}_")
+            lines.append(f"_{user_dt(p.wng_last_upd_time).strftime('%d/%m %H:%M')}_")
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"Error: {e}")
@@ -695,9 +756,7 @@ async def cmd_anomalies(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # timestamp
             ts = health.payload.wng_last_upd_time
             if ts:
-                if ts.tzinfo is not None:
-                    ts = ts.astimezone()
-                details.append(f"_Health updated: {ts.strftime('%d/%m %H:%M')}_")
+                details.append(f"_Health updated: {user_dt(ts).strftime('%d/%m %H:%M')}_")
 
         # 2) Remote status — overall warning counts / status
         if remote_status and remote_status.payload:
@@ -712,9 +771,7 @@ async def cmd_anomalies(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 has_anomaly = True
                 details.append(f"⚠️ Overall status: {overall}")
             if p.last_update_timestamp:
-                ts2 = p.last_update_timestamp
-                if ts2.tzinfo is not None:
-                    ts2 = ts2.astimezone()
+                ts2 = user_dt(p.last_update_timestamp)
                 details.append(f"_Status updated: {ts2.strftime('%d/%m %H:%M')}_")
 
         if not has_anomaly:
@@ -778,9 +835,9 @@ async def cmd_last_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if trip.score:
             lines.append(f"Score: {trip.score:.0f}/100")
         if trip.start_time:
-            lines.append(f"Start: {trip.start_time}")
+            lines.append(f"Start: {user_dt(trip.start_time):%d/%m/%Y %H:%M}")
         if trip.end_time:
-            lines.append(f"End: {trip.end_time}")
+            lines.append(f"End: {user_dt(trip.end_time):%d/%m/%Y %H:%M}")
         loc = trip.locations
         if loc and loc.start:
             start_gm = f"https://www.google.com/maps?q={loc.start.lat},{loc.start.lon}"
@@ -791,7 +848,7 @@ async def cmd_last_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _day_key(st: datetime) -> date:
-    return st.date() if st.tzinfo is None else st.astimezone().date()
+    return user_dt(st).date()
 
 
 async def _summarize_day(car, target: date) -> str | None:
@@ -864,7 +921,7 @@ async def cmd_trips(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text(
                 "Usage: /trips <days ago>  (e.g. 0 = today, 1 = yesterday)"
             )
-    target = date.today() - timedelta(days=days_ago)
+    target = _today() - timedelta(days=days_ago)
     msg = await update.message.reply_text(f"Fetching trips for {target:%d/%m/%Y}...")
     try:
         car = await get_car()
@@ -907,7 +964,7 @@ def _parse_day_input(text: str) -> tuple[date | None, str | None]:
     text = text.strip()
     try:
         days_ago = max(int(text), 0)
-        return date.today() - timedelta(days=days_ago), None
+        return _today() - timedelta(days=days_ago), None
     except ValueError:
         pass
     try:
@@ -941,7 +998,7 @@ async def receive_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not 1 <= month <= 12:
         await update.message.reply_text("Month must be between 1 and 12.")
         return MONTH_WAIT
-    now = date.today()
+    now = _today()
     year = now.year if month <= now.month else now.year - 1
     target = date(year, month, 1)
     await update.message.reply_text(f"Fetching trips for {target:%B %Y}...")
@@ -967,14 +1024,14 @@ async def cmd_scores(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"Fetching driving scores ({days}d)...")
     try:
         car = await get_car()
-        from_date = date.today() - timedelta(days=days)
-        trips = await car.get_trips(from_date, date.today())
+        from_date = _today() - timedelta(days=days)
+        trips = await car.get_trips(from_date, _today())
         if not trips:
             await msg.edit_text("No trips in period.")
             return
         lines = [f"*Driving scores ({len(trips)} trips)*"]
         for t in trips[:15]:
-            start = t.start_time.strftime("%d/%m") if t.start_time else "?"
+            start = user_dt(t.start_time).strftime("%d/%m") if t.start_time else "?"
             score = t.score
             if score is not None:
                 lines.append(f"• {start} — overall {score:.0f}/100")
@@ -1000,7 +1057,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         car = await get_car()
         days = 365 if st == SummaryType.YEARLY else 90
         s = await car.get_summary(
-            date.today() - timedelta(days=days), date.today(), summary_type=st
+            _today() - timedelta(days=days), _today(), summary_type=st
         )
         if not s:
             await msg.edit_text("No summary data.")
@@ -1082,9 +1139,10 @@ async def receive_temp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Send a valid number (e.g. 22)")
         return TEMP_WAIT
-    if not 14 <= temp <= 29:
+    if not TEMP_MIN <= temp <= TEMP_MAX:
         await update.message.reply_text(
-            "Temperature must be between 14 and 29°C for this vehicle. Send another value or /cancel"
+            f"Temperature must be between {TEMP_MIN} and {TEMP_MAX}°C for this vehicle. "
+            "Send another value or /cancel"
         )
         return TEMP_WAIT
 
@@ -1171,23 +1229,14 @@ def _climate_outcome_text(action, temp, outcome, state, started):
     if action == "start":
         if outcome == "ok":
             # AC auto-offs after 20 min — tell the user when
-            try:
-                if started and getattr(started, "tzinfo", None):
-                    base = started.astimezone()
-                elif started:
-                    base = started
-                else:
-                    base = datetime.now().astimezone()
-                off = base + timedelta(minutes=20)
-                off_str = off.strftime("%H:%M %d/%m")
-                return (
-                    f"AC set to {temp}°C and started (confirmed by the car). "
-                    f"Will auto-off at {off_str} (~20 min)."
-                )
-            except Exception:
-                return f"AC set to {temp}°C and started (confirmed by the car). Will auto-off in ~20 min."
+            base = user_dt(started) or datetime.now(USER_TZ)
+            off = base + timedelta(minutes=20)
+            return (
+                f"AC set to {temp}°C and started (confirmed by the car). "
+                f"Will auto-off at {off.strftime('%H:%M %d/%m')} (~20 min)."
+            )
         if outcome == "already":
-            when = started.strftime("%d/%m %H:%M") if started else "earlier"
+            when = user_dt(started).strftime("%d/%m %H:%M") if started else "earlier"
             return (
                 f"The AC was already running (since {when}) and the new activation was "
                 "not confirmed — the engine may need to be on before a new AC activation. "
@@ -1239,9 +1288,9 @@ async def cmd_climate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp = float(context.args[0])
     except ValueError:
         return await update.message.reply_text("Temperature must be a number")
-    if not 14 <= temp <= 29:
+    if not TEMP_MIN <= temp <= TEMP_MAX:
         return await update.message.reply_text(
-            "Temperature must be between 14 and 29°C for this vehicle"
+            f"Temperature must be between {TEMP_MIN} and {TEMP_MAX}°C for this vehicle"
         )
 
     msg = await update.message.reply_text(f"Setting AC to {temp}°C...")
@@ -1351,6 +1400,69 @@ async def cmd_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"Error: {e}")
 
 
+async def cmd_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = check_allowed(update)
+    if uid:
+        await update.message.reply_text(f"Access denied. Your ID: {uid}")
+        return ConversationHandler.END
+    if config.get("timezone"):
+        await update.message.reply_text(
+            f"Note: config.json sets 'timezone' to '{config['timezone']}' and "
+            "takes priority over the choice made here."
+        )
+    location_kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Share my location", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        f"Current timezone: {USER_TZ} ({TZ_SOURCE}).\n"
+        "Share your location with the button below, or type a timezone name "
+        "like Europe/Rome (or /cancel).",
+        reply_markup=location_kb,
+    )
+    return TZ_WAIT
+
+
+async def _apply_timezone(update: Update, name: str) -> int:
+    global USER_TZ, TZ_SOURCE
+    USER_TZ = ZoneInfo(name)
+    TZ_SOURCE = "data/data.json, set via /timezone"
+    data = load_data()
+    data["timezone"] = name
+    save_data(data)
+    logger.info(f"Timezone set to {name} via /timezone")
+    await update.message.reply_text(
+        f"Timezone set to {name} — current time: {datetime.now(USER_TZ):%H:%M %d/%m/%Y}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+async def receive_tz_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loc = update.message.location
+    name = _find_timezone(loc.latitude, loc.longitude) if loc else None
+    if not name:
+        await update.message.reply_text(
+            "Could not determine a timezone from that location. "
+            "Type one instead, e.g. Europe/Rome (or /cancel)."
+        )
+        return TZ_WAIT
+    return await _apply_timezone(update, name)
+
+
+async def receive_tz_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    try:
+        ZoneInfo(name)
+    except Exception:
+        await update.message.reply_text(
+            f"'{name}' is not a valid timezone name. Try e.g. Europe/Rome (or /cancel)."
+        )
+        return TZ_WAIT
+    return await _apply_timezone(update, name)
+
+
 # ── Notifications ────────────────────────────────────────────────────────
 
 
@@ -1394,7 +1506,7 @@ async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await msg.edit_text("No notifications.")
         lines = []
         for n in notifs[:10]:
-            ds = n.date.strftime("%d/%m %H:%M") if n.date else "?"
+            ds = user_dt(n.date).strftime("%d/%m %H:%M") if n.date else "?"
             lines.append(f"• [{ds}] {n.message or n.category or n.type}")
         await msg.edit_text("\n".join(lines))
     except Exception as e:
@@ -1436,7 +1548,7 @@ async def poll_notifications(context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
 
         for n in new:
-            ds = n.date.strftime("%d/%m %H:%M") if n.date else "?"
+            ds = user_dt(n.date).strftime("%d/%m %H:%M") if n.date else "?"
             text = f"🚗 *{n.category or 'Notification'}*\n{ds}\n{n.message or '—'}"
             for cid in data.get("notify_chats", []):
                 try:
@@ -1538,9 +1650,28 @@ def main():
         conversation_timeout=600,
     )
 
+    tz_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("timezone", cmd_timezone),
+            MessageHandler(filters.Text("Set timezone"), cmd_timezone),
+        ],
+        states={
+            TZ_WAIT: [
+                MessageHandler(filters.LOCATION, receive_tz_location),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Text(ALL_LABELS),
+                    receive_tz_text,
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        conversation_timeout=600,
+    )
+
     app.add_handler(ac_conv)
     app.add_handler(CommandHandler("ac_on", cmd_ac_on))
     app.add_handler(trips_conv)
+    app.add_handler(tz_conv)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
 
