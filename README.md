@@ -18,7 +18,7 @@ see trips and driving scores, and receive app notifications.
 - Reads live vehicle data: fuel level, HV battery, EV/fuel range, odometer, charging status
 - Reads door/window/hood lock status and the last parked location
 - Reads warning lights, engine-oil status and service history
-- Checks for **anomalies** (dashboard warnings + vehicle status warnings) via `/anomalies` button
+- Checks for **anomalies** via the `/anomalies` button and lists the precise causes: dashboard warning lights plus unlocked/opened doors, hood and trunk, open windows, lights left on and the rear-seat reminder (wakes the car for fresh state)
 - Reads trips, driving scores and consumption summaries
 - Sends remote commands: lock/unlock, hazards, trunk, buzzer, climate (with auto-off notice), charging
 - Polls the app's notification feed every 5 minutes and forwards new ones to your chat
@@ -121,7 +121,7 @@ Options: `--purge`, `--keep-venv`, `--remove-config`, `--remove-data`, `--disabl
 | `/climate_status` | AC state and target temperature |
 | `/location` | Last parked location (Google Maps link) |
 | `/health` | Warning lights and engine-oil status |
-| `/anomalies` | Check for anomalies (combines health warnings + vehicle status `overall_warning_counts`) |
+| `/anomalies` | Check for anomalies and see what caused them: health warning lights + vehicle status details (unlocked/opened doors, hood, trunk, windows, lights, rear-seat reminder). Wakes the car first |
 | `/service_history` | Dealer visits |
 | `/trips [n]` | Total km driven `n` days ago (`0` = today, `1` = yesterday, ...) |
 | `/trip` | Alias for `/trips` |

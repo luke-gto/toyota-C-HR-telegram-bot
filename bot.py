@@ -358,7 +358,7 @@ HELP_TEXT = (
     "/climate_status  — AC state & target\n"
     "/location  — last parked location\n"
     "/health  — warning lights, oil\n"
-    "/anomalies  — check for anomalies (warnings)\n"
+    "/anomalies  — check for anomalies (warning lights + causes)\n"
     "/service_history  — dealer visits\n"
     "/trips [n]  — km driven n days ago (0 = today)\n"
     "/trip  — alias for /trips\n"
@@ -684,6 +684,146 @@ def _health_item_text(item):
     return str(item)
 
 
+_STATUS_DOOR_LABELS = [
+    ("driver", "Driver"),
+    ("passenger", "Passenger"),
+    ("rearLeft", "Rear left"),
+    ("rearRight", "Rear right"),
+    ("rearBack", "Trunk"),
+]
+
+_STATUS_WINDOW_LABELS = [
+    ("driver", "Driver"),
+    ("passenger", "Passenger"),
+    ("rearLeft", "Rear left"),
+    ("rearRight", "Rear right"),
+]
+
+_STATUS_LIGHT_LABELS = {
+    "head": "Headlights",
+    "tail": "Tail lights",
+    "hazard": "Hazards",
+}
+
+
+def _api_ts(value: datetime | str | None) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _status_anomaly_lines(payload: dict) -> list[str]:
+    """Precise causes of the warning count from a /v1/vehicle/status payload."""
+    lines: list[str] = []
+    doors = payload.get("doors") or {}
+    unlocked: list[str] = []
+    opened: list[str] = []
+    for key, label in _STATUS_DOOR_LABELS:
+        door = doors.get(key) or {}
+        if (door.get("lockStatus") or {}).get("status") == "unlocked":
+            unlocked.append(label)
+        if (door.get("openStatus") or {}).get("status") == "open":
+            opened.append(label)
+    if ((doors.get("hood") or {}).get("openStatus") or {}).get("status") == "open":
+        opened.append("Hood")
+    if unlocked:
+        lines.append(f"🔓 Unlocked: {', '.join(unlocked)}")
+    if opened:
+        lines.append(f"🚪 Open: {', '.join(opened)}")
+
+    windows = payload.get("windows") or {}
+    w_open = [
+        label
+        for key, label in _STATUS_WINDOW_LABELS
+        if (windows.get(key) or {}).get("status") == "open"
+    ]
+    w_vent = [
+        label
+        for key, label in _STATUS_WINDOW_LABELS
+        if (windows.get(key) or {}).get("status") == "venting"
+    ]
+    if w_open:
+        lines.append(f"🪟 Windows open: {', '.join(w_open)}")
+    if w_vent:
+        lines.append(f"🪟 Windows venting: {', '.join(w_vent)}")
+
+    lights = payload.get("lights") or {}
+    on = [
+        _STATUS_LIGHT_LABELS.get(key, key.title())
+        for key, val in lights.items()
+        if (val or {}).get("status") == "on"
+    ]
+    if on:
+        lines.append(f"💡 Lights on: {', '.join(on)}")
+
+    rear = payload.get("rearSeatReminder") or {}
+    if rear.get("warning") is True or rear.get("reason") not in (
+        None,
+        "",
+        "notDetected",
+    ):
+        lines.append("🪑 Rear seat reminder")
+    return lines
+
+
+def _anomalies_text(title: str, health, status: dict) -> str:
+    """Build the /anomalies report from health and raw status payloads."""
+    lines = [f"*{title}* — anomalies"]
+    details: list[str] = []
+    has_anomaly = False
+
+    if health:
+        warnings = health.warning or []
+        if warnings:
+            has_anomaly = True
+            details.append(f"⚠️ Dashboard warnings: {len(warnings)}")
+            for w in warnings[:10]:
+                details.append(f"  • {_health_item_text(w)}")
+        oil = health.quantity_of_eng_oil_icon or []
+        if oil:
+            has_anomaly = True
+            details.append("⚠️ Engine oil: " + ", ".join(map(_health_item_text, oil)))
+
+    component = _status_anomaly_lines(status)
+    if component:
+        has_anomaly = True
+        details.extend(component)
+
+    count = status.get("overallWarningCounts")
+    grouped = status.get("groupedWarningCount")
+    overall = status.get("overallStatus")
+    if count is not None and count > 0:
+        has_anomaly = True
+        grouped_txt = f" in {grouped} group(s)" if grouped else ""
+        details.append(
+            f"⚠️ {count} vehicle status warning(s){grouped_txt} "
+            f"(overall: {overall or '?'})"
+        )
+    elif overall and overall.lower() not in ("ok", "normal", "no_warning", ""):
+        has_anomaly = True
+        details.append(f"⚠️ Overall status: {overall}")
+
+    if has_anomaly:
+        lines.append("Anomalies found:")
+        lines.extend(details)
+    else:
+        lines.append("✅ No anomalies detected — all systems normal.")
+        lines.extend(details)
+
+    if health and health.wng_last_upd_time:
+        health_ts = user_dt(health.wng_last_upd_time).strftime("%d/%m %H:%M")
+        lines.append(f"_Health updated: {health_ts}_")
+    status_ts = _api_ts(status.get("lastUpdateTimestamp"))
+    if status_ts:
+        lines.append(f"_Status updated: {user_dt(status_ts).strftime('%d/%m %H:%M')}_")
+    return "\n".join(lines)
+
+
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = check_allowed(update)
     if uid:
@@ -723,66 +863,22 @@ async def cmd_anomalies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     msg = await update.message.reply_text("Checking for anomalies...")
     try:
-        await ensure_client()
+        car = await get_car()
+        title = car.alias or "C-HR"
+        await msg.edit_text("Waking the car, this can take up to 30 seconds...")
+        try:
+            await car.update(only=["status"])
+        except Exception:
+            pass
+        await get_lock_status(car)
         api = client._api
-        # Fetch health and status in parallel — both carry anomaly signals
         health, remote_status = await asyncio.gather(
             api.get_vehicle_health_status(vin),
-            api.get_remote_status(vin),
+            api.controller.request_json("GET", "/v1/vehicle/status", vin=vin),
         )
-        try:
-            car = (await client.get_vehicles())[0]
-            title = car.alias or "C-HR"
-        except Exception:
-            title = "Vehicle"
-        lines = [f"*{title}* — anomalies"]
-
-        has_anomaly = False
-        details: list[str] = []
-
-        # 1) Health — dashboard warning lights
-        if health and health.payload:
-            warnings = health.payload.warning or []
-            if warnings:
-                has_anomaly = True
-                details.append(f"⚠️ Dashboard warnings: {len(warnings)}")
-                for w in warnings[:10]:
-                    details.append(f"  • {_health_item_text(w)}")
-            oil = health.payload.quantity_of_eng_oil_icon or []
-            # quantityOfEngOilIcon is present only when oil needs attention
-            if oil:
-                has_anomaly = True
-                details.append("⚠️ Engine oil: " + ", ".join(map(_health_item_text, oil)))
-            # timestamp
-            ts = health.payload.wng_last_upd_time
-            if ts:
-                details.append(f"_Health updated: {user_dt(ts).strftime('%d/%m %H:%M')}_")
-
-        # 2) Remote status — overall warning counts / status
-        if remote_status and remote_status.payload:
-            p = remote_status.payload
-            count = p.overall_warning_counts
-            overall = p.overall_status
-            if count is not None and count > 0:
-                has_anomaly = True
-                details.append(f"⚠️ Vehicle status warnings: {count} (overall: {overall or '?'})")
-            elif overall and overall.lower() not in ("ok", "normal", "no_warning", ""):
-                # Some vehicles report overall_status != ok even with count 0
-                has_anomaly = True
-                details.append(f"⚠️ Overall status: {overall}")
-            if p.last_update_timestamp:
-                ts2 = user_dt(p.last_update_timestamp)
-                details.append(f"_Status updated: {ts2.strftime('%d/%m %H:%M')}_")
-
-        if not has_anomaly:
-            lines.append("✅ No anomalies detected — all systems normal.")
-            if details:
-                lines.extend(details)
-        else:
-            lines.append("Anomalies found:")
-            lines.extend(details)
-
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        payload = (remote_status or {}).get("payload") or {}
+        text = _anomalies_text(title, health.payload if health else None, payload)
+        await msg.edit_text(text, parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"Error: {e}")
 

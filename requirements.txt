@@ -1,5 +1,5 @@
 loguru==0.7.3
-pytoyoda==5.2.0
+pytoyoda==5.2.1
 python-telegram-bot[job-queue]==22.8
 timezonefinder==8.3.0
 tzlocal==5.4.4
