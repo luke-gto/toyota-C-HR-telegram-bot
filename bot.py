@@ -2,8 +2,11 @@
 import asyncio
 import calendar
 import json
+import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone, tzinfo
+from functools import wraps
 from pathlib import Path
 from typing import overload
 from zoneinfo import ZoneInfo
@@ -19,20 +22,30 @@ from pytoyoda.client import MyT
 from pytoyoda.models.endpoints.climate import V2RemoteClimateControlRequestModel
 from pytoyoda.models.endpoints.command import CommandType
 from pytoyoda.models.endpoints.common import _MessagesModel, UnitValueModel
-from pytoyoda.models.endpoints.electric import (
-    ChargeCommandType,
-    NextChargeSettings,
-)
+from pytoyoda.models.endpoints.electric import ChargeCommandType, NextChargeSettings
 from pytoyoda.models.summary import SummaryType
-from telegram import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
-    ContextTypes,
 )
+from telegram.helpers import escape_markdown
 from timezonefinder import TimezoneFinder
 from tzlocal import get_localzone_name
 
@@ -40,11 +53,28 @@ HERE = Path(__file__).parent
 CONFIG_FILE = HERE / "config.json"
 DATA_FILE = HERE / "data" / "data.json"
 
-with open(CONFIG_FILE) as f:
-    config = json.load(f)
 
-TOYOTA_CFG = config["toyota"]
-TOKEN = config["telegram"]["token"]
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error(f"Config file not found: {CONFIG_FILE}")
+        logger.error("Copy config.example.json to config.json and fill it in.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        logger.error(f"Config file {CONFIG_FILE} is not valid JSON: {e}")
+        sys.exit(1)
+
+
+config = _load_config()
+
+TOYOTA_CFG = config.get("toyota", {})
+try:
+    TOKEN = config["telegram"]["token"]
+except (KeyError, TypeError):
+    logger.error("Missing telegram.token in config.json")
+    sys.exit(1)
 ALLOWED_USERS = config.get("allowed_user_ids")
 if not isinstance(ALLOWED_USERS, list) or len(ALLOWED_USERS) == 0:
     logger.error(
@@ -55,29 +85,67 @@ if not isinstance(ALLOWED_USERS, list) or len(ALLOWED_USERS) == 0:
 
 TEMP_WAIT = 1
 PERIOD_WAIT = 2
-DAY_WAIT = 3
-MONTH_WAIT = 4
+RANGE_WAIT = 3
 TZ_WAIT = 5
 
 TEMP_MIN = 18
 TEMP_MAX = 29
 
+# Upper bounds for user-supplied ranges so a typo cannot request years of data.
+MAX_TRIP_DAYS_AGO = 365
+MAX_TRIP_RANGE_DAYS = 365
+MAX_SCORE_DAYS = 90
+
+# Keep each Telegram message safely below the 4096-character limit.
+MSG_CHUNK = 3500
+
+# Trip-summary inline button callbacks.
+TS_DAY = "trips_day"
+TS_MONTH = "trips_month"
+TS_RANGE = "trips_range"
+TS_BACK = "trips_back"
+
 client: MyT | None = None
+car = None
 vin: str | None = None
+
+# Protects the lazy login/vehicle fetch from concurrent first-command races.
+_client_lock = asyncio.Lock()
+# Serialises vehicle wakeups so several users cannot trigger simultaneous
+# 12 V wakeups (Toyota's gateway rate-limits bursts with 429/APIGW-403).
+_wake_lock = asyncio.Lock()
+# Protects read-modify-write cycles on data/data.json.
+_data_lock = asyncio.Lock()
 
 
 # ── helpers ──────────────────────────────────────────────────────────
 
 
-def load_data():
-    if DATA_FILE.exists():
+def esc(value) -> str:
+    """Escape dynamic text for Telegram's legacy Markdown parse mode."""
+    return escape_markdown(str(value), version=1)
+
+
+class UserError(Exception):
+    """An expected failure whose message is safe to show to the user."""
+
+
+def load_data() -> dict:
+    try:
         return json.loads(DATA_FILE.read_text())
-    return {"notify_chats": [], "last_notification": None}
+    except FileNotFoundError:
+        return {"notify_chats": [], "last_notification": None}
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"data.json unreadable ({e}); starting from defaults")
+        return {"notify_chats": [], "last_notification": None}
 
 
 def save_data(data):
+    """Atomically persist data.json so a crash cannot truncate it."""
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(json.dumps(data, indent=2, default=str))
+    tmp = DATA_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, default=str))
+    os.replace(tmp, DATA_FILE)
 
 
 def _resolve_timezone() -> tuple[tzinfo, str]:
@@ -116,11 +184,78 @@ def _find_timezone(lat: float, lng: float) -> str | None:
     return finder.timezone_at(lat=lat, lng=lng)
 
 
-def check_allowed(update: Update) -> int | None:
-    uid = update.effective_user.id
-    if uid not in ALLOWED_USERS:
-        return uid
-    return None
+async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reject any update from a user not on the allowlist.
+
+    Registered as a group=-1 TypeHandler so it runs before every other handler
+    (including conversations) and stops further processing.
+    """
+    user = update.effective_user
+    if user is None:
+        return
+    if user.id not in ALLOWED_USERS:
+        logger.warning(f"Denied user {user.id} (@{user.username})")
+        if update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    f"Access denied. Your ID: {user.id}"
+                )
+            except TelegramError:
+                pass
+        raise ApplicationHandlerStop
+
+
+def handler(func):
+    """Wrap a handler so unexpected errors are logged, not leaked to the user."""
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            return await func(update, context)
+        except UserError as e:
+            await _report_error(update, context, str(e))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f"Handler {func.__name__} failed")
+            await _report_error(
+                update, context, "Something went wrong. Please try again."
+            )
+        finally:
+            context.user_data.pop("_status", None)
+
+    return wrapper
+
+
+async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Send a placeholder message and remember it for later edits/error reports."""
+    msg = await update.effective_message.reply_text(text)
+    context.user_data["_status"] = msg
+    return msg
+
+
+async def set_status(context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    """Edit the placeholder message started by ``progress``."""
+    msg = context.user_data.get("_status")
+    if msg is not None:
+        await msg.edit_text(text, **kwargs)
+    elif text:
+        raise UserError(text)
+
+
+async def _report_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    msg = context.user_data.get("_status")
+    if msg is not None:
+        try:
+            await msg.edit_text(text)
+            return
+        except TelegramError:
+            pass
+    if update.effective_message:
+        try:
+            await update.effective_message.reply_text(text)
+        except TelegramError:
+            logger.warning("Could not deliver error message to chat")
 
 
 @overload
@@ -136,57 +271,103 @@ def user_dt(dt: datetime | None) -> datetime | None:
     return dt.astimezone(USER_TZ)
 
 
+def _aware_utc(dt: datetime | None) -> datetime | None:
+    """Normalise any timestamp to timezone-aware UTC (for safe comparisons)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _today() -> date:
     return datetime.now(USER_TZ).date()
 
 
-async def ensure_client():
-    global client, vin
+async def get_client() -> MyT:
+    """Return the logged-in client, creating it once under a lock."""
+    global client, car, vin
     if client is None:
-        c = MyT(
-            username=TOYOTA_CFG["username"],
-            password=TOYOTA_CFG["password"],
-            use_metric=True,
-            brand=TOYOTA_CFG.get("brand", "T"),
-        )
-        await c.login()
-        vehicles = await c.get_vehicles()
+        async with _client_lock:
+            if client is None:
+                c = MyT(
+                    username=TOYOTA_CFG["username"],
+                    password=TOYOTA_CFG["password"],
+                    use_metric=True,
+                    brand=TOYOTA_CFG.get("brand", "T"),
+                )
+                await c.login()
+                vehicles = await c.get_vehicles()
+                if not vehicles:
+                    raise UserError("No vehicles found on the account.")
+                client = c
+                car = vehicles[0]
+                vin = car.vin
+    return client
+
+
+async def get_car(only: list[str] | None = None):
+    """Return the cached vehicle, optionally refreshing just ``only`` endpoints.
+
+    Passing ``only`` avoids the full ``update()`` fan-out (~10 endpoints) that
+    otherwise trips Toyota's burst rate limit; read handlers should always pass
+    exactly the endpoints they need.
+    """
+    global car, vin
+    await get_client()
+    if car is None:
+        vehicles = await client.get_vehicles()
         if not vehicles:
-            raise RuntimeError("No vehicles found on account")
-        client = c
-        vin = vehicles[0].vin
-
-
-async def get_car():
-    await ensure_client()
-    vehicles = await client.get_vehicles()
-    car = vehicles[0]
-    await car.update(skip=["status"])
+            raise UserError("No vehicles found on the account.")
+        car = vehicles[0]
+        vin = car.vin
+    if only is not None:
+        await car.update(only=only)
     return car
 
 
-async def get_lock_status(car):
-    """Fetch fresh door/window status following the pytoyoda README.
+def _api():
+    """Access the pytoyoda Api object.
 
-    GET /v1/global/remote/status (used by Vehicle.lock_status) frequently
-    returns 429 APIGW-403. Wake the vehicle with POST refresh-status first
-    (the same call the Toyota app makes), then poll the status endpoint
-    until lock_status.last_updated advances past the cached value.
+    pytoyoda exposes no public accessor for a few calls the bot needs (health
+    status, climate status/settings, the raw /v1/vehicle/status payload), so we
+    reach for it in one place instead of scattering ``client._api`` around.
     """
-    before = car.lock_status.last_updated if car.lock_status else None
-    if before:
-        await car.refresh_status()
-    for _ in range(3):
+    return client._api
+
+
+def _electric_payload(vehicle):
+    """Raw electric payload, needed for fuel level/range that the public
+    ``Vehicle.dashboard``/``ElectricStatus`` properties do not expose for PHEVs.
+    """
+    raw = vehicle._endpoint_data.get("electric_status")
+    return raw.payload if raw else None
+
+
+async def refresh_lock_status(vehicle, attempts: int = 3, delay: float = 3.0):
+    """Wake the vehicle and fetch fresh door/window status.
+
+    POST refresh-status (the call the Toyota app makes) warms the gateway
+    cache that GET /v1/vehicle/status reads; the endpoint otherwise returns a
+    cached, stale value (or 429 APIGW-403).
+    """
+    before = vehicle.lock_status.last_updated if vehicle.lock_status else None
+    async with _wake_lock:
         try:
-            await car.update(only=["status"])
+            await vehicle.refresh_status()
         except Exception:
-            await asyncio.sleep(2)
-            continue
-        after = car.lock_status.last_updated if car.lock_status else None
-        if after and (not before or after > before):
-            return car.lock_status
-        await asyncio.sleep(3)
-    return car.lock_status
+            logger.warning("refresh_status failed while fetching lock status")
+        for _ in range(attempts):
+            try:
+                await vehicle.update(only=["status"])
+            except Exception:
+                await asyncio.sleep(delay)
+                continue
+            after = vehicle.lock_status.last_updated if vehicle.lock_status else None
+            if after and (not before or after > before):
+                break
+            await asyncio.sleep(delay)
+    return vehicle.lock_status
 
 
 def _fmt(result):
@@ -196,7 +377,9 @@ def _fmt(result):
         return result.status.messages[0].description
     payload = getattr(result, "payload", None)
     if payload is not None:
-        rc = getattr(payload, "return_code", None) or getattr(payload, "returnCode", None)
+        rc = getattr(payload, "return_code", None) or getattr(
+            payload, "returnCode", None
+        )
         if rc:
             return "ok" if rc == "000000" else f"return code {rc}"
     return str(result.status)
@@ -225,33 +408,43 @@ def app_battery_pct(soc: float | None, car_type: str | None) -> float | None:
     return min(max(value, 0.0), 100.0)
 
 
+def _fuel_data(vehicle) -> tuple[float | None, float | None]:
+    """Fuel percentage and fuel range, preferring the public dashboard."""
+    dash = vehicle.dashboard if vehicle else None
+    level = dash.fuel_level if dash else None
+    rng = dash.fuel_range if dash else None
+    if level is None or rng is None:
+        payload = _electric_payload(vehicle)
+        if payload is not None:
+            if level is None:
+                level = payload.fuel_level
+            if rng is None and payload.fuel_range and payload.fuel_range.value:
+                rng = payload.fuel_range.value
+    return level, rng
+
+
 def _simple_cmd(command_name: str, cmd_type: CommandType, beeps: int = 0):
     """Factory for simple one-shot remote commands."""
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = check_allowed(update)
-        if uid:
-            return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-        msg = await update.message.reply_text(f"Executing {command_name}...")
-        try:
-            await ensure_client()
-            car = (await client.get_vehicles())[0]
-            result = await car.post_command(cmd_type, beeps=beeps)
-            await msg.edit_text(f"{command_name}: {_fmt(result)}")
-        except Exception as e:
-            await msg.edit_text(f"Error: {e}")
-    return handler
+    @handler
+    async def run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await progress(update, context, f"Executing {command_name}...")
+        vehicle = await get_car()
+        result = await vehicle.post_command(cmd_type, beeps=beeps)
+        await set_status(context, f"{command_name}: {_fmt(result)}")
+
+    return run
 
 
-def _door_locked(car, door: str = "driver") -> bool | None:
+def _door_locked(vehicle, door: str = "driver") -> bool | None:
     """Whether a door is locked, None if unknown. door: "driver" or "trunk"."""
-    doors = car.lock_status.doors if car.lock_status else None
+    doors = vehicle.lock_status.doors if vehicle.lock_status else None
     if doors is None:
         return None
     d = doors.driver_seat if door == "driver" else doors.trunk
     return d.locked if d else None
 
 
-async def _verify_lock(car, target: str, before_locked: bool | None,
+async def _verify_lock(vehicle, target: str, before_locked: bool | None,
                        door: str = "driver",
                        attempts: int = 6, delay: float = 5.0):
     """Wait for the car to confirm a lock/unlock command.
@@ -266,17 +459,17 @@ async def _verify_lock(car, target: str, before_locked: bool | None,
     want = target == "locked"
     for _ in range(attempts):
         try:
-            await car.update(only=["status"])
+            await vehicle.update(only=["status"])
         except Exception:
             await asyncio.sleep(delay)
             continue
-        current = _door_locked(car, door)
+        current = _door_locked(vehicle, door)
         if current == want:
             if before_locked is None or before_locked != want:
                 return "ok", current
             return "already", current
         await asyncio.sleep(delay)
-    return "timeout", _door_locked(car, door)
+    return "timeout", _door_locked(vehicle, door)
 
 
 def _lock_outcome_text(target: str, outcome: str, noun: str = "doors"):
@@ -339,9 +532,9 @@ def build_keyboard():
 
 
 async def route_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    handler = BUTTON_HANDLERS.get(update.message.text)
-    if handler:
-        await handler(update, context)
+    cb = BUTTON_HANDLERS.get(update.message.text)
+    if cb:
+        await cb(update, context)
 
 
 # ── /help ─────────────────────────────────────────────────────────────
@@ -362,7 +555,7 @@ HELP_TEXT = (
     "/service_history  — dealer visits\n"
     "/trips [n]  — km driven n days ago (0 = today)\n"
     "/trip  — alias for /trips\n"
-    "/trips_summary  — day or month totals (asks)\n"
+    "/trips_summary  — day/month buttons or a typed date range\n"
     "/last_trip  — last trip details\n"
     "/scores [days]  — driving scores\n"
     "/summary <d|w|m|y>  — consumption summary\n"
@@ -391,127 +584,95 @@ HELP_TEXT = (
 )
 
 
+@handler
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    await update.message.reply_text(HELP_TEXT,
-                                    reply_markup=build_keyboard())
+    await update.message.reply_text(HELP_TEXT, reply_markup=build_keyboard())
 
 
 # ── /start ────────────────────────────────────────────────────────────
 
 
+@handler
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(
-            f"Access denied. Your ID is {uid} — add it to allowed_user_ids in config."
-        )
-    await update.message.reply_text(HELP_TEXT,
-                                    reply_markup=build_keyboard())
+    await update.message.reply_text(HELP_TEXT, reply_markup=build_keyboard())
 
 
 # ── Info commands ──────────────────────────────────────────────────────
 
 
+@handler
 async def cmd_vehicles(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching...")
-    try:
-        await ensure_client()
-        vs = await client.get_vehicles()
-        lines = []
-        for v in vs:
-            typ = v.type or "?"
-            alias = v.alias or "—"
-            lines.append(f"• {alias} — {typ}")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Fetching...")
+    await get_client()
+    vs = await client.get_vehicles()
+    lines = [f"• {esc(v.alias or '—')} — {esc(v.type or '?')}" for v in vs]
+    await set_status(context, "\n".join(lines) or "No vehicles.", parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_lock_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Waking and refreshing lock status...")
-    try:
-        car = await get_car()
-        ls = await get_lock_status(car)
-        if not ls:
-            return await msg.edit_text("Lock status not available.")
-        doors = ls.doors
-        lines = [f"*{car.alias or 'C-HR'}* lock status"]
-        if doors:
-            add = [
-                ("Driver", doors.driver_seat),
-                ("Rear driver", doors.driver_rear_seat),
-                ("Passenger", doors.passenger_seat),
-                ("Rear pass.", doors.passenger_rear_seat),
-                ("Trunk", doors.trunk),
-            ]
-            for label, door in add:
-                if door is None:
-                    continue
-                locked = door.locked
-                closed = door.closed
-                if locked is not None:
-                    lines.append(f"• {label}: {'locked' if locked else 'unlocked'}")
-                elif closed is not None:
-                    lines.append(f"• {label}: {'closed' if closed else 'open'}")
-        if ls.hood:
-            h = ls.hood
-            if h.locked is not None:
-                lines.append(f"• Hood: {'locked' if h.locked else 'unlocked'}")
-            elif h.closed is not None:
-                lines.append(f"• Hood: {'closed' if h.closed else 'open'}")
-        windows = ls.windows
-        if windows:
-            wlines = []
-            for w in (windows.driver_seat, windows.driver_rear_seat,
-                      windows.passenger_seat, windows.passenger_rear_seat):
-                if w is not None and w.closed is not None:
-                    wlines.append("closed" if w.closed else "open")
-            if wlines:
-                lines.append(f"• Windows: {', '.join(wlines)}")
-        if ls.last_updated:
-            lines.append(f"_{user_dt(ls.last_updated).strftime('%d/%m %H:%M')}_")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Waking and refreshing lock status...")
+    vehicle = await get_car()
+    ls = await refresh_lock_status(vehicle)
+    if not ls:
+        return await set_status(context, "Lock status not available.")
+    doors = ls.doors
+    lines = [f"*{esc(vehicle.alias or 'C-HR')}* lock status"]
+    if doors:
+        add = [
+            ("Driver", doors.driver_seat),
+            ("Rear driver", doors.driver_rear_seat),
+            ("Passenger", doors.passenger_seat),
+            ("Rear pass.", doors.passenger_rear_seat),
+            ("Trunk", doors.trunk),
+        ]
+        for label, door in add:
+            if door is None:
+                continue
+            locked = door.locked
+            closed = door.closed
+            if locked is not None:
+                lines.append(f"• {label}: {'locked' if locked else 'unlocked'}")
+            elif closed is not None:
+                lines.append(f"• {label}: {'closed' if closed else 'open'}")
+    if ls.hood:
+        h = ls.hood
+        if h.locked is not None:
+            lines.append(f"• Hood: {'locked' if h.locked else 'unlocked'}")
+        elif h.closed is not None:
+            lines.append(f"• Hood: {'closed' if h.closed else 'open'}")
+    windows = ls.windows
+    if windows:
+        wlines = []
+        for w in (windows.driver_seat, windows.driver_rear_seat,
+                  windows.passenger_seat, windows.passenger_rear_seat):
+            if w is not None and w.closed is not None:
+                wlines.append("closed" if w.closed else "open")
+        if wlines:
+            lines.append(f"• Windows: {', '.join(wlines)}")
+    if ls.last_updated:
+        lines.append(f"_{user_dt(ls.last_updated).strftime('%d/%m %H:%M')}_")
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Waking vehicle and fetching fresh status...")
-    try:
-        car = await get_car()
+    await progress(update, context, "Waking vehicle and fetching fresh status...")
+    vehicle = await get_car()
+    await vehicle.update(only=["electric_status", "telemetry"])
 
-        def electric_ts():
-            raw = car._endpoint_data.get("electric_status")
-            if raw and raw.payload and raw.payload.last_update_timestamp:
-                return raw.payload.last_update_timestamp
-            return None
+    def fuel_seen() -> bool:
+        level, rng = _fuel_data(vehicle)
+        return bool((level or 0) > 0 or rng)
 
-        def fuel_seen():
-            raw = car._endpoint_data.get("electric_status")
-            if raw and raw.payload:
-                if (raw.payload.fuel_level or 0) > 0:
-                    return True
-                if raw.payload.fuel_range and raw.payload.fuel_range.value:
-                    return True
-            return False
+    es = vehicle.electric_status
+    before = es.last_update_timestamp if es else None
+    woke = False
 
-        before = electric_ts()
-        woke = False
-        if before or not fuel_seen():
+    if before or not fuel_seen():
+        async with _wake_lock:
             try:
-                r = await car.refresh_status()
+                r = await vehicle.refresh_status()
                 rc = getattr(r.payload, "return_code", None)
                 woke = rc == "000000"
             except Exception:
@@ -519,163 +680,140 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for _ in range(4):
                 await asyncio.sleep(6)
                 try:
-                    await car.update(only=["electric_status", "telemetry"])
+                    await vehicle.update(only=["electric_status", "telemetry"])
                 except Exception:
                     continue
-                after = electric_ts()
-                if woke and after and (not before or after > before):
-                    break
+                es = vehicle.electric_status
+                after = es.last_update_timestamp if es else None
                 if fuel_seen():
                     break
-        logger.info(f"Status woke={woke} fresh={fuel_seen()}")
+                if woke and after and (not before or after > before):
+                    break
+    logger.info(f"Status woke={woke} fresh={fuel_seen()}")
 
-        raw = car._endpoint_data.get("electric_status")
-        ep = raw.payload if raw else None
-        tele = car._endpoint_data.get("telemetry")
-        tp = tele.payload if tele else None
-        lines = [f"*{car.alias or 'C-HR'}*"]
-        if tp and tp.odometer and tp.odometer.value:
-            lines.append(f"Odometer: {tp.odometer.value:,.0f} km")
-        fuel_pct = ep.fuel_level if ep and ep.fuel_level is not None else None
-        fuel_range = None
-        if ep and ep.fuel_range and ep.fuel_range.value:
-            fuel_range = ep.fuel_range.value
-        if fuel_range:
-            lines.append(f"Fuel range: {fuel_range:,.0f} km")
-        if fuel_pct is not None:
-            lines.append(f"Fuel: {fuel_pct}%")
-        if ep and ep.battery_level is not None:
-            pct = app_battery_pct(ep.battery_level, car.type)
-            lines.append(f"HV battery: {pct:.0f}%")
-        if ep and ep.ev_range and ep.ev_range.value:
-            lines.append(f"EV range: {ep.ev_range.value:,.0f} km")
-        if ep and ep.ev_range_with_ac and ep.ev_range_with_ac.value:
-            lines.append(f"EV range (AC): {ep.ev_range_with_ac.value:,.0f} km")
-        if ep and ep.charging_status:
-            lines.append(f"Charging: {ep.charging_status}")
-        if not fuel_seen():
-            lines.append("_(data may be stale — wake failed)_")
-        settings = car.climate_settings
-        if settings and settings.temperature:
-            t = settings.temperature
-            lines.append(f"Target: {t.value}°{t.unit}")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    dash = vehicle.dashboard
+    es = vehicle.electric_status
+    lines = [f"*{esc(vehicle.alias or 'C-HR')}*"]
+    if dash and dash.odometer:
+        lines.append(f"Odometer: {dash.odometer:,.0f} km")
+    fuel_pct, fuel_range = _fuel_data(vehicle)
+    if fuel_range:
+        lines.append(f"Fuel range: {fuel_range:,.0f} km")
+    if fuel_pct is not None:
+        lines.append(f"Fuel: {fuel_pct}%")
+    if es and es.battery_level is not None:
+        pct = app_battery_pct(es.battery_level, vehicle.type)
+        lines.append(f"HV battery: {pct:.0f}%")
+    if es and es.ev_range:
+        lines.append(f"EV range: {es.ev_range:,.0f} km")
+    if es and es.ev_range_with_ac:
+        lines.append(f"EV range (AC): {es.ev_range_with_ac:,.0f} km")
+    if es and es.charging_status:
+        lines.append(f"Charging: {esc(es.charging_status)}")
+    if not fuel_seen():
+        lines.append("_(data may be stale — wake failed)_")
+    settings = vehicle.climate_settings
+    if settings and settings.temperature:
+        t = settings.temperature
+        lines.append(f"Target: {t.value}°{esc(t.unit)}")
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching battery & charging info...")
-    try:
-        car = await get_car()
-        elec = car.electric_status
-        if not elec:
-            return await msg.edit_text("No electric status available.")
-        lines = [f"*{car.alias or 'C-HR'}* — battery/charging"]
-        if elec.battery_level is not None:
-            pct = app_battery_pct(elec.battery_level, car.type)
-            lines.append(f"Battery: {pct:.0f}%")
-        if elec.ev_range is not None:
-            lines.append(f"EV range: {elec.ev_range:,.0f} km")
-        if elec.charging_status:
-            lines.append(f"Charging: {elec.charging_status}")
-        if elec.remaining_charge_time is not None:
-            lines.append(f"Charge done in: {elec.remaining_charge_time:.0f} min")
-        if elec.ev_range_with_ac is not None:
-            lines.append(f"EV range (AC on): {elec.ev_range_with_ac:,.0f} km")
-        raw = car._endpoint_data.get("electric_status")
-        payload = raw.payload if raw else None
-        next_ev = getattr(payload, "next_charging_event", None) if payload else None
-        if next_ev and next_ev.timestamp:
-            lines.append(
-                f"Next charge: {next_ev.event_type} "
-                f"{user_dt(next_ev.timestamp).strftime('%d/%m %H:%M')}"
-            )
-        schedules = getattr(payload, "charging_schedules", None) if payload else None
-        if schedules:
-            lines.append(f"Schedules: {len(schedules)}")
-            for s in schedules[:5]:
-                days_on = [
-                    d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-                    if getattr(s.days, d, False)
-                ]
-                days_str = ", ".join(d[:3] for d in days_on) if days_on else "?"
-                start = f"{s.start_time.hour:02d}:{s.start_time.minute:02d}"
-                end = None
-                if s.end_time:
-                    end = f"{s.end_time.hour:02d}:{s.end_time.minute:02d}"
-                range_str = f"{start}–{end}" if end else f"{start}"
-                lines.append(f"• [{days_str}] {range_str}" + ("" if s.enabled else " (off)"))
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Fetching battery & charging info...")
+    vehicle = await get_car(only=["electric_status"])
+    elec = vehicle.electric_status
+    if not elec:
+        return await set_status(context, "No electric status available.")
+    lines = [f"*{esc(vehicle.alias or 'C-HR')}* — battery/charging"]
+    if elec.battery_level is not None:
+        pct = app_battery_pct(elec.battery_level, vehicle.type)
+        lines.append(f"Battery: {pct:.0f}%")
+    if elec.ev_range is not None:
+        lines.append(f"EV range: {elec.ev_range:,.0f} km")
+    if elec.charging_status:
+        lines.append(f"Charging: {esc(elec.charging_status)}")
+    if elec.remaining_charge_time is not None:
+        lines.append(f"Charge done in: {elec.remaining_charge_time:.0f} min")
+    if elec.ev_range_with_ac is not None:
+        lines.append(f"EV range (AC on): {elec.ev_range_with_ac:,.0f} km")
+    next_ev = elec.next_charging_event
+    if next_ev and next_ev.timestamp:
+        lines.append(
+            f"Next charge: {esc(next_ev.event_type)} "
+            f"{user_dt(next_ev.timestamp).strftime('%d/%m %H:%M')}"
+        )
+    schedules = elec.charging_schedules
+    if schedules:
+        lines.append(f"Schedules: {len(schedules)}")
+        for s in schedules[:5]:
+            days_on = [
+                d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+                if getattr(s.days, d, False)
+            ]
+            days_str = ", ".join(d[:3] for d in days_on) if days_on else "?"
+            start = f"{s.start_time.hour:02d}:{s.start_time.minute:02d}"
+            end = None
+            if s.end_time:
+                end = f"{s.end_time.hour:02d}:{s.end_time.minute:02d}"
+            range_str = f"{start}–{end}" if end else f"{start}"
+            lines.append(f"• [{days_str}] {range_str}" + ("" if s.enabled else " (off)"))
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_climate_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching climate status...")
-    try:
-        await ensure_client()
-        api = client._api
-        status = await api.get_climate_status(vin)
-        settings = await api.get_climate_settings(vin)
+    await progress(update, context, "Fetching climate status...")
+    await get_client()
+    api = _api()
+    status = await api.get_climate_status(vin)
+    settings = await api.get_climate_settings(vin)
 
-        lines = ["*Climate*"]
-        p = status.payload
-        if p:
-            state = p.status or "unknown"
-            lines.append(f"Active: {'yes' if state == 'running' else 'no'} ({state})")
-            if p.duration:
-                lines.append(f"Duration: {p.duration} min")
-            if p.started_at:
-                lines.append(f"Started: {user_dt(p.started_at):%d/%m %H:%M}")
-            if p.current_temperature:
-                cur = p.current_temperature
-                lines.append(f"Cabin: {cur.value}°{cur.unit}")
-            if p.target_temperature:
-                tgt = p.target_temperature
-                lines.append(f"Target: {tgt.value}°{tgt.unit}")
-        s = settings.payload
-        if s:
-            if s.temperature:
-                t = s.temperature
-                lines.append(f"Temp: {t.value}°{t.unit}")
-            if s.duration:
-                lines.append(f"Settings duration: {s.duration} min")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    lines = ["*Climate*"]
+    p = status.payload
+    if p:
+        state = p.status or "unknown"
+        lines.append(f"Active: {'yes' if state == 'running' else 'no'} ({esc(state)})")
+        if p.duration:
+            lines.append(f"Duration: {p.duration} min")
+        if p.started_at:
+            lines.append(f"Started: {user_dt(p.started_at):%d/%m %H:%M}")
+        if p.current_temperature:
+            cur = p.current_temperature
+            lines.append(f"Cabin: {cur.value}°{esc(cur.unit)}")
+        if p.target_temperature:
+            tgt = p.target_temperature
+            lines.append(f"Target: {tgt.value}°{esc(tgt.unit)}")
+    s = settings.payload
+    if s:
+        if s.temperature:
+            t = s.temperature
+            lines.append(f"Temp: {t.value}°{esc(t.unit)}")
+        if s.duration:
+            lines.append(f"Settings duration: {s.duration} min")
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching location...")
-    try:
-        car = await get_car()
-        loc = car.location
-        if not loc or loc.latitude is None:
-            await msg.edit_text("Location not available.")
-            return
-        lat, lon = loc.latitude, loc.longitude
-        maps = f"https://www.google.com/maps?q={lat},{lon}"
-        text = f"📍 [{lat:.5f}, {lon:.5f}]({maps})"
-        if loc.state:
-            text += f"\n{loc.state}"
-        if loc.timestamp:
-            text += f"\n_{user_dt(loc.timestamp).strftime('%d/%m %H:%M')}_"
-        await msg.edit_text(text, parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Fetching location...")
+    vehicle = await get_car(only=["location"])
+    loc = vehicle.location
+    if not loc or loc.latitude is None:
+        return await set_status(context, "Location not available.")
+    lat, lon = loc.latitude, loc.longitude
+    maps = f"https://www.google.com/maps?q={lat},{lon}"
+    text = f"📍 [{lat:.5f}, {lon:.5f}]({maps})"
+    if loc.state:
+        text += f"\n{esc(loc.state)}"
+    if loc.timestamp:
+        text += f"\n_{user_dt(loc.timestamp).strftime('%d/%m %H:%M')}_"
+    await set_status(context, text, parse_mode=ParseMode.MARKDOWN,
+                     disable_web_page_preview=True)
 
 
-def _health_item_text(item):
+def _health_item_text(item) -> str:
     if isinstance(item, dict):
         for key in ("description", "code", "name", "message"):
             if item.get(key):
@@ -754,7 +892,7 @@ def _status_anomaly_lines(payload: dict) -> list[str]:
 
     lights = payload.get("lights") or {}
     on = [
-        _STATUS_LIGHT_LABELS.get(key, key.title())
+        str(_STATUS_LIGHT_LABELS.get(key, str(key).title()))
         for key, val in lights.items()
         if (val or {}).get("status") == "on"
     ]
@@ -773,7 +911,7 @@ def _status_anomaly_lines(payload: dict) -> list[str]:
 
 def _anomalies_text(title: str, health, status: dict) -> str:
     """Build the /anomalies report from health and raw status payloads."""
-    lines = [f"*{title}* — anomalies"]
+    lines = [f"*{esc(title)}* — anomalies"]
     details: list[str] = []
     has_anomaly = False
 
@@ -783,11 +921,13 @@ def _anomalies_text(title: str, health, status: dict) -> str:
             has_anomaly = True
             details.append(f"⚠️ Dashboard warnings: {len(warnings)}")
             for w in warnings[:10]:
-                details.append(f"  • {_health_item_text(w)}")
+                details.append(f"  • {esc(_health_item_text(w))}")
         oil = health.quantity_of_eng_oil_icon or []
         if oil:
             has_anomaly = True
-            details.append("⚠️ Engine oil: " + ", ".join(map(_health_item_text, oil)))
+            details.append(
+                "⚠️ Engine oil: " + ", ".join(esc(_health_item_text(o)) for o in oil)
+            )
 
     component = _status_anomaly_lines(status)
     if component:
@@ -802,11 +942,11 @@ def _anomalies_text(title: str, health, status: dict) -> str:
         grouped_txt = f" in {grouped} group(s)" if grouped else ""
         details.append(
             f"⚠️ {count} vehicle status warning(s){grouped_txt} "
-            f"(overall: {overall or '?'})"
+            f"(overall: {esc(overall or '?')})"
         )
     elif overall and overall.lower() not in ("ok", "normal", "no_warning", ""):
         has_anomaly = True
-        details.append(f"⚠️ Overall status: {overall}")
+        details.append(f"⚠️ Overall status: {esc(overall)}")
 
     if has_anomaly:
         lines.append("Anomalies found:")
@@ -824,131 +964,105 @@ def _anomalies_text(title: str, health, status: dict) -> str:
     return "\n".join(lines)
 
 
+@handler
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching health...")
-    try:
-        await ensure_client()
-        api = client._api
-        h = await api.get_vehicle_health_status(vin)
-        if not h.payload:
-            await msg.edit_text("No health data.")
-            return
-        p = h.payload
-        lines = ["*Vehicle health*"]
-        warnings = p.warning or []
-        if warnings:
-            lines.append("Warnings:")
-            for w in warnings:
-                lines.append(f"⚠ {_health_item_text(w)}")
-        else:
-            lines.append("Warnings: none")
-        oil = p.quantity_of_eng_oil_icon or []
-        if oil:
-            lines.append("Engine oil: " + ", ".join(map(_health_item_text, oil)))
-        else:
-            lines.append("Engine oil: OK")
-        if p.wng_last_upd_time:
-            lines.append(f"_{user_dt(p.wng_last_upd_time).strftime('%d/%m %H:%M')}_")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Fetching health...")
+    await get_client()
+    api = _api()
+    h = await api.get_vehicle_health_status(vin)
+    if not h.payload:
+        return await set_status(context, "No health data.")
+    p = h.payload
+    lines = ["*Vehicle health*"]
+    warnings = p.warning or []
+    if warnings:
+        lines.append("Warnings:")
+        for w in warnings:
+            lines.append(f"⚠ {esc(_health_item_text(w))}")
+    else:
+        lines.append("Warnings: none")
+    oil = p.quantity_of_eng_oil_icon or []
+    if oil:
+        lines.append("Engine oil: " + ", ".join(esc(_health_item_text(o)) for o in oil))
+    else:
+        lines.append("Engine oil: OK")
+    if p.wng_last_upd_time:
+        lines.append(f"_{user_dt(p.wng_last_upd_time).strftime('%d/%m %H:%M')}_")
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_anomalies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Checking for anomalies...")
-    try:
-        car = await get_car()
-        title = car.alias or "C-HR"
-        await msg.edit_text("Waking the car, this can take up to 30 seconds...")
-        try:
-            await car.update(only=["status"])
-        except Exception:
-            pass
-        await get_lock_status(car)
-        api = client._api
-        health, remote_status = await asyncio.gather(
-            api.get_vehicle_health_status(vin),
-            api.controller.request_json("GET", "/v1/vehicle/status", vin=vin),
-        )
-        payload = (remote_status or {}).get("payload") or {}
-        text = _anomalies_text(title, health.payload if health else None, payload)
-        await msg.edit_text(text, parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Checking for anomalies...")
+    vehicle = await get_car()
+    title = vehicle.alias or "C-HR"
+    await set_status(context, "Waking the car, this can take up to 30 seconds...")
+    await refresh_lock_status(vehicle)
+    await get_client()
+    api = _api()
+    health, remote_status = await asyncio.gather(
+        api.get_vehicle_health_status(vin),
+        api.controller.request_json("GET", "/v1/vehicle/status", vin=vin),
+    )
+    payload = (remote_status or {}).get("payload") or {}
+    text = _anomalies_text(title, health.payload if health else None, payload)
+    await set_status(context, text, parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_service_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching service history...")
-    try:
-        car = await get_car()
-        history = car.service_history
-        if not history:
-            await msg.edit_text("No service history.")
-            return
-        lines = []
-        for s in history[:10]:
-            date_str = s.service_date.strftime("%d/%m/%Y") if s.service_date else "?"
-            dealer = s.servicing_dealer or ""
-            cat = s.service_category or ""
-            lines.append(f"• {date_str} — {cat} {dealer}")
-        await msg.edit_text("\n".join(lines))
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Fetching service history...")
+    vehicle = await get_car(only=["service_history"])
+    history = vehicle.service_history
+    if not history:
+        return await set_status(context, "No service history.")
+    lines = []
+    for s in history[:10]:
+        date_str = s.service_date.strftime("%d/%m/%Y") if s.service_date else "?"
+        dealer = s.servicing_dealer or ""
+        cat = s.service_category or ""
+        lines.append(f"• {date_str} — {esc(cat)} {esc(dealer)}")
+    await set_status(context, "\n".join(lines))
 
 
+@handler
 async def cmd_last_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching last trip...")
-    try:
-        car = await get_car()
-        trip = await car.get_last_trip()
-        if not trip:
-            await msg.edit_text("No trip data.")
-            return
-        dur = trip.duration
-        dur_str = f"{dur.seconds // 60} min" if dur else "?"
-        lines = [
-            "*Last trip*",
-            f"Distance: {trip.distance or '?'} km",
-            f"Duration: {dur_str}",
-        ]
-        avg_fuel = trip.average_fuel_consumed
-        if avg_fuel:
-            lines.append(f"Avg fuel: {avg_fuel} l/100km")
-        if trip.ev_distance and trip.ev_distance > 0:
-            lines.append(f"EV distance: {trip.ev_distance:.1f} km")
-        if trip.score:
-            lines.append(f"Score: {trip.score:.0f}/100")
-        if trip.start_time:
-            lines.append(f"Start: {user_dt(trip.start_time):%d/%m/%Y %H:%M}")
-        if trip.end_time:
-            lines.append(f"End: {user_dt(trip.end_time):%d/%m/%Y %H:%M}")
-        loc = trip.locations
-        if loc and loc.start:
-            start_gm = f"https://www.google.com/maps?q={loc.start.lat},{loc.start.lon}"
-            lines.append(f"[Start map]({start_gm})")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Fetching last trip...")
+    vehicle = await get_car()
+    trip = await vehicle.get_last_trip()
+    if not trip:
+        return await set_status(context, "No trip data.")
+    dur = trip.duration
+    dur_str = f"{dur.seconds // 60} min" if dur else "?"
+    lines = [
+        "*Last trip*",
+        f"Distance: {trip.distance or '?'} km",
+        f"Duration: {dur_str}",
+    ]
+    avg_fuel = trip.average_fuel_consumed
+    if avg_fuel:
+        lines.append(f"Avg fuel: {avg_fuel} l/100km")
+    if trip.ev_distance and trip.ev_distance > 0:
+        lines.append(f"EV distance: {trip.ev_distance:.1f} km")
+    if trip.score:
+        lines.append(f"Score: {trip.score:.0f}/100")
+    if trip.start_time:
+        lines.append(f"Start: {user_dt(trip.start_time):%d/%m/%Y %H:%M}")
+    if trip.end_time:
+        lines.append(f"End: {user_dt(trip.end_time):%d/%m/%Y %H:%M}")
+    loc = trip.locations
+    if loc and loc.start:
+        start_gm = f"https://www.google.com/maps?q={loc.start.lat},{loc.start.lon}"
+        lines.append(f"[Start map]({start_gm})")
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 def _day_key(st: datetime) -> date:
     return user_dt(st).date()
 
 
-async def _summarize_day(car, target: date) -> str | None:
-    trips = await car.get_trips(target - timedelta(days=1), target + timedelta(days=1))
+async def _summarize_day(vehicle, target: date) -> str | None:
+    trips = await vehicle.get_trips(target - timedelta(days=1), target + timedelta(days=1))
     if not trips:
         return None
     total = ev_total = 0.0
@@ -973,13 +1087,13 @@ async def _summarize_day(car, target: date) -> str | None:
     return "\n".join(lines)
 
 
-async def _summarize_month(car, target: date) -> str | None:
+async def _summarize_month(vehicle, target: date) -> str | None:
     first = date(target.year, target.month, 1)
     last = date(
         target.year, target.month,
         calendar.monthrange(target.year, target.month)[1],
     )
-    trips = await car.get_trips(first - timedelta(days=1), last + timedelta(days=1))
+    trips = await vehicle.get_trips(first - timedelta(days=1), last + timedelta(days=1))
     if not trips:
         return None
     total = ev_total = 0.0
@@ -1005,167 +1119,321 @@ async def _summarize_month(car, target: date) -> str | None:
     return "\n".join(lines)
 
 
+@handler
 async def cmd_trips(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     days_ago = 0
     if context.args:
         try:
-            days_ago = max(int(context.args[0]), 0)
+            days_ago = int(context.args[0])
         except ValueError:
             return await update.message.reply_text(
                 "Usage: /trips <days ago>  (e.g. 0 = today, 1 = yesterday)"
             )
+        days_ago = max(0, min(days_ago, MAX_TRIP_DAYS_AGO))
     target = _today() - timedelta(days=days_ago)
-    msg = await update.message.reply_text(f"Fetching trips for {target:%d/%m/%Y}...")
+    await progress(update, context, f"Fetching trips for {target:%d/%m/%Y}...")
+    vehicle = await get_car()
+    text = await _summarize_day(vehicle, target)
+    await set_status(context, text or f"No trips on {target:%d/%m/%Y}.")
+
+
+# ── /trips_summary conversation ────────────────────────────────────────
+
+
+RANGE_PROMPT = (
+    "Send the date range as dd/mm/yyyy - dd/mm/yyyy\n"
+    "Example: 01/10/2026 - 15/10/2026\n"
+    f"Maximum {MAX_TRIP_RANGE_DAYS} days."
+)
+
+_RANGE_RE = re.compile(
+    r"^\s*(\d{1,2}/\d{1,2}/\d{4})\s*(?:-|–|to|,)\s*(\d{1,2}/\d{1,2}/\d{4})\s*$",
+    re.IGNORECASE,
+)
+
+
+def _back_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton("Back", callback_data=TS_BACK)
+
+
+def _trips_summary_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Day", callback_data=TS_DAY),
+            InlineKeyboardButton("Month", callback_data=TS_MONTH),
+            InlineKeyboardButton("Date range", callback_data=TS_RANGE),
+        ]]
+    )
+
+
+def _day_picker_keyboard(today: date | None = None) -> InlineKeyboardMarkup:
+    today = today or _today()
+    buttons = []
+    for days_ago in range(7):
+        target = today - timedelta(days=days_ago)
+        if days_ago == 0:
+            label = "Today"
+        elif days_ago == 1:
+            label = "Yesterday"
+        else:
+            label = f"{target:%a %d/%m}"
+        buttons.append(
+            InlineKeyboardButton(
+                label, callback_data=f"{TS_DAY}:{target.isoformat()}"
+            )
+        )
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _add_months(first: date, months: int) -> date:
+    total = first.month - 1 + months
+    year = first.year + total // 12
+    month = total % 12 + 1
+    return date(year, month, 1)
+
+
+def _month_picker_keyboard(today: date | None = None) -> InlineKeyboardMarkup:
+    today = today or _today()
+    first = today.replace(day=1)
+    buttons = []
+    for months_ago in range(12):
+        target = _add_months(first, -months_ago)
+        buttons.append(
+            InlineKeyboardButton(
+                f"{target:%B %Y}",
+                callback_data=f"{TS_MONTH}:{target:%Y-%m}",
+            )
+        )
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _parse_range_input(text: str) -> tuple[date | None, date | None, str | None]:
+    match = _RANGE_RE.match(text)
+    if not match:
+        return None, None, "Send the range as dd/mm/yyyy - dd/mm/yyyy."
     try:
-        car = await get_car()
-        text = await _summarize_day(car, target)
-        await msg.edit_text(text or f"No trips on {target:%d/%m/%Y}.")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+        start = datetime.strptime(match.group(1), "%d/%m/%Y").date()
+        end = datetime.strptime(match.group(2), "%d/%m/%Y").date()
+    except ValueError:
+        return None, None, "Those dates are not valid. Use dd/mm/yyyy - dd/mm/yyyy."
+    if start > end:
+        return None, None, "The start date must be before or equal to the end date."
+    if end > _today():
+        return None, None, "The end date cannot be in the future."
+    if (end - start).days + 1 > MAX_TRIP_RANGE_DAYS:
+        return None, None, f"Ranges are limited to {MAX_TRIP_RANGE_DAYS} days."
+    return start, end, None
 
 
+def _build_range_summary(trips, start: date, end: date) -> str:
+    by_day: dict[date, list[float]] = {}
+    for trip in trips or []:
+        started = trip.start_time
+        if started is None or trip.distance is None:
+            continue
+        day = _day_key(started)
+        if day < start or day > end:
+            continue
+        totals = by_day.setdefault(day, [0.0, 0.0, 0])
+        totals[0] += trip.distance
+        ev = getattr(trip, "ev_distance", None)
+        if ev:
+            totals[1] += ev
+        totals[2] += 1
+
+    lines = [f"*Trips {start:%d/%m/%Y} – {end:%d/%m/%Y}*"]
+    total = ev_total = 0.0
+    current = start
+    while current <= end:
+        distance, ev, count = by_day.get(current, (0.0, 0.0, 0))
+        total += distance
+        ev_total += ev
+        suffix = f" ({count} trip{'s' if count != 1 else ''})" if count else ""
+        lines.append(f"• {current:%a %d/%m} — {distance:.1f} km{suffix}")
+        current += timedelta(days=1)
+    lines.append(f"Total: {total:.1f} km")
+    if ev_total > 0:
+        lines.append(f"EV: {ev_total:.1f} km")
+    return "\n".join(lines)
+
+
+async def _summarize_range(vehicle, start: date, end: date) -> str:
+    trips = await vehicle.get_trips(start - timedelta(days=1), end + timedelta(days=1))
+    return _build_range_summary(trips, start, end)
+
+
+def _split_message(text: str, limit: int = MSG_CHUNK) -> list[str]:
+    """Split text on line boundaries so each chunk fits a Telegram message."""
+    if not text:
+        return [""]
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    current = ""
+    for line in text.splitlines():
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _send_long(update, context, text: str, **kwargs):
+    chunks = _split_message(text)
+    await set_status(context, chunks[0], **kwargs)
+    for chunk in chunks[1:]:
+        await update.effective_message.reply_text(chunk, **kwargs)
+
+
+@handler
 async def cmd_trips_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        await update.message.reply_text(f"Access denied. Your ID: {uid}")
-        return ConversationHandler.END
     await update.message.reply_text(
-        "Trip summary — send *day* or *month* (or /cancel)."
+        "Trip summary — pick a period:",
+        reply_markup=_trips_summary_keyboard(),
     )
     return PERIOD_WAIT
 
 
-async def receive_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip().lower()
-    if choice in ("day", "d"):
-        await update.message.reply_text(
-            "Which day?\n"
-            "• number: 0 = today, 1 = yesterday, ...\n"
-            "• or date: dd/mm/yyyy"
+async def _show_callback_day(query, target: date):
+    await query.edit_message_text(f"Fetching trips for {target:%d/%m/%Y}...")
+    vehicle = await get_car()
+    text = await _summarize_day(vehicle, target) or f"No trips on {target:%d/%m/%Y}."
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def _show_callback_month(query, target: date):
+    await query.edit_message_text(f"Fetching trips for {target:%B %Y}...")
+    vehicle = await get_car()
+    text = await _summarize_month(vehicle, target) or f"No trips in {target:%B %Y}."
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@handler
+async def receive_trips_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == TS_DAY:
+        await query.edit_message_text(
+            "Pick a day:", reply_markup=_day_picker_keyboard()
         )
-        return DAY_WAIT
-    if choice in ("month", "m"):
-        await update.message.reply_text(
-            "Which month? Send 1–12 (1 = January, ..., 12 = December)."
+        return PERIOD_WAIT
+    if data == TS_MONTH:
+        await query.edit_message_text(
+            "Pick a month:", reply_markup=_month_picker_keyboard()
         )
-        return MONTH_WAIT
-    await update.message.reply_text("Please send 'day' or 'month'.")
-    return PERIOD_WAIT
+        return PERIOD_WAIT
+    if data == TS_RANGE:
+        await query.edit_message_text(
+            RANGE_PROMPT,
+            reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+        )
+        return RANGE_WAIT
+    if data == TS_BACK:
+        await query.edit_message_text(
+            "Trip summary — pick a period:",
+            reply_markup=_trips_summary_keyboard(),
+        )
+        return PERIOD_WAIT
 
+    if data.startswith(f"{TS_DAY}:"):
+        try:
+            target = date.fromisoformat(data.split(":", 1)[1])
+        except ValueError:
+            await query.edit_message_text("Invalid day selection.")
+            return ConversationHandler.END
+        await _show_callback_day(query, target)
+        return ConversationHandler.END
 
-def _parse_day_input(text: str) -> tuple[date | None, str | None]:
-    text = text.strip()
-    try:
-        days_ago = max(int(text), 0)
-        return _today() - timedelta(days=days_ago), None
-    except ValueError:
-        pass
-    try:
-        return datetime.strptime(text, "%d/%m/%Y").date(), None
-    except ValueError:
-        return None, "Use a number (0 = today) or a date like 12/08/2026."
+    if data.startswith(f"{TS_MONTH}:"):
+        try:
+            target = date.fromisoformat(f"{data.split(':', 1)[1]}-01")
+        except ValueError:
+            await query.edit_message_text("Invalid month selection.")
+            return ConversationHandler.END
+        await _show_callback_month(query, target)
+        return ConversationHandler.END
 
-
-async def receive_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target, err = _parse_day_input(update.message.text)
-    if err:
-        await update.message.reply_text(err)
-        return DAY_WAIT
-    await update.message.reply_text(f"Fetching trips for {target:%d/%m/%Y}...")
-    try:
-        car = await get_car()
-        text = await _summarize_day(car, target)
-        await update.message.reply_text(text or f"No trips on {target:%d/%m/%Y}.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
     return ConversationHandler.END
 
 
-async def receive_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    try:
-        month = int(raw)
-    except ValueError:
-        await update.message.reply_text("Please send a number 1–12.")
-        return MONTH_WAIT
-    if not 1 <= month <= 12:
-        await update.message.reply_text("Month must be between 1 and 12.")
-        return MONTH_WAIT
-    now = _today()
-    year = now.year if month <= now.month else now.year - 1
-    target = date(year, month, 1)
-    await update.message.reply_text(f"Fetching trips for {target:%B %Y}...")
-    try:
-        car = await get_car()
-        text = await _summarize_month(car, target)
-        await update.message.reply_text(text or f"No trips in {target:%B %Y}.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+@handler
+async def receive_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start, end, err = _parse_range_input(update.message.text or "")
+    if err or start is None or end is None:
+        await update.message.reply_text(f"{err}\n\n{RANGE_PROMPT}")
+        return RANGE_WAIT
+    await progress(
+        update, context, f"Fetching trips {start:%d/%m/%Y} – {end:%d/%m/%Y}..."
+    )
+    vehicle = await get_car()
+    text = await _summarize_range(vehicle, start, end)
+    await _send_long(update, context, text, parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
 
+@handler
 async def cmd_scores(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     days = 7
     if context.args:
         try:
             days = int(context.args[0])
         except ValueError:
             pass
-    msg = await update.message.reply_text(f"Fetching driving scores ({days}d)...")
-    try:
-        car = await get_car()
-        from_date = _today() - timedelta(days=days)
-        trips = await car.get_trips(from_date, _today())
-        if not trips:
-            await msg.edit_text("No trips in period.")
-            return
-        lines = [f"*Driving scores ({len(trips)} trips)*"]
-        for t in trips[:15]:
-            start = user_dt(t.start_time).strftime("%d/%m") if t.start_time else "?"
-            score = t.score
-            if score is not None:
-                lines.append(f"• {start} — overall {score:.0f}/100")
-            else:
-                lines.append(f"• {start} — no score")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    days = max(1, min(days, MAX_SCORE_DAYS))
+    await progress(update, context, f"Fetching driving scores ({days}d)...")
+    vehicle = await get_car()
+    from_date = _today() - timedelta(days=days)
+    trips = await vehicle.get_trips(from_date, _today())
+    if not trips:
+        return await set_status(context, "No trips in period.")
+    lines = [f"*Driving scores ({len(trips)} trips)*"]
+    for t in trips[:15]:
+        start = user_dt(t.start_time).strftime("%d/%m") if t.start_time else "?"
+        score = t.score
+        if score is not None:
+            lines.append(f"• {start} — overall {score:.0f}/100")
+        else:
+            lines.append(f"• {start} — no score")
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@handler
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     typ_map = {"d": SummaryType.DAILY, "w": SummaryType.WEEKLY,
                "m": SummaryType.MONTHLY, "y": SummaryType.YEARLY}
-    st = typ_map.get(context.args[0] if context.args else None, SummaryType.MONTHLY)
+    arg = context.args[0] if context.args else None
+    st = typ_map.get(arg, SummaryType.MONTHLY)
     label = {"d": "Daily", "w": "Weekly", "m": "Monthly", "y": "Yearly"}.get(
-        context.args[0] if context.args else None, "Monthly"
+        arg, "Monthly"
     )
-    msg = await update.message.reply_text(f"Fetching {label} summary...")
-    try:
-        car = await get_car()
-        days = 365 if st == SummaryType.YEARLY else 90
-        s = await car.get_summary(
-            _today() - timedelta(days=days), _today(), summary_type=st
-        )
-        if not s:
-            await msg.edit_text("No summary data.")
-            return
-        lines = [f"*{label} summary*"]
-        for item in s[:12]:
-            start = item.from_date.strftime("%d/%m") if item.from_date else "?"
-            end = item.to_date.strftime("%d/%m") if item.to_date else "?"
-            lines.append(f"• {start}-{end}: {item.distance or '?'} km")
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, f"Fetching {label} summary...")
+    vehicle = await get_car()
+    days = 365 if st == SummaryType.YEARLY else 90
+    s = await vehicle.get_summary(
+        _today() - timedelta(days=days), _today(), summary_type=st
+    )
+    if not s:
+        return await set_status(context, "No summary data.")
+    lines = [f"*{label} summary*"]
+    for item in s[:12]:
+        start = item.from_date.strftime("%d/%m") if item.from_date else "?"
+        end = item.to_date.strftime("%d/%m") if item.to_date else "?"
+        lines.append(f"• {start}-{end}: {item.distance or '?'} km")
+    await set_status(context, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Remote command handlers ──────────────────────────────────────────
@@ -1174,30 +1442,34 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _lock_cmd(command_name: str, cmd_type: CommandType, target: str,
               door: str = "driver", noun: str = "doors"):
     """Handler for lock/unlock that waits for vehicle confirmation."""
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = check_allowed(update)
-        if uid:
-            return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-        msg = await update.message.reply_text(f"{command_name}...")
+    @handler
+    async def run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await progress(update, context, f"{command_name}...")
+        vehicle = await get_car()
         try:
-            await ensure_client()
-            car = (await client.get_vehicles())[0]
-            before = _door_locked(car, door)
-            result = await car.post_command(cmd_type)
-            payload = getattr(result, "payload", None)
-            rc = getattr(payload, "return_code", None) or getattr(payload, "returnCode", None)
-            if rc and rc != "000000":
-                return await msg.edit_text(f"{command_name} failed (return code {rc}).")
-            await msg.edit_text(
-                f"{command_name} — waiting for the car to confirm (up to ~30 s)..."
+            await vehicle.update(only=["status"])
+        except Exception:
+            pass
+        before = _door_locked(vehicle, door)
+        result = await vehicle.post_command(cmd_type)
+        payload = getattr(result, "payload", None)
+        rc = getattr(payload, "return_code", None) or getattr(
+            payload, "returnCode", None
+        )
+        if rc and rc != "000000":
+            return await set_status(
+                context, f"{command_name} failed (return code {rc})."
             )
-            outcome, _ = await _verify_lock(car, target, before, door)
-            await msg.edit_text(
-                f"{command_name}: {_lock_outcome_text(target, outcome, noun)}"
-            )
-        except Exception as e:
-            await msg.edit_text(f"Error: {e}")
-    return handler
+        await set_status(
+            context,
+            f"{command_name} — waiting for the car to confirm (up to ~30 s)...",
+        )
+        outcome, _ = await _verify_lock(vehicle, target, before, door)
+        await set_status(
+            context, f"{command_name}: {_lock_outcome_text(target, outcome, noun)}"
+        )
+
+    return run
 
 
 cmd_lock = _lock_cmd("Lock doors", CommandType.DOOR_LOCK, "locked")
@@ -1214,22 +1486,45 @@ cmd_buzzer = _simple_cmd("Buzzer warning", CommandType.BUZZER_WARNING)
 # ── Climate ─────────────────────────────────────────────────────────────
 
 
+def _climate_request(temp: float):
+    return V2RemoteClimateControlRequestModel(
+        command="start",
+        temperature=UnitValueModel(value=temp, unit="C"),
+        save_settings=True,
+    )
+
+
+async def _start_climate(update, context, temp: float):
+    """Shared climate-start flow used by /ac_on and /climate."""
+    await progress(update, context, f"Setting AC to {temp}°C and starting...")
+    await get_client()
+    api = _api()
+    vehicle = await get_car()
+    try:
+        before = await api.get_climate_status(vin)
+    except Exception:
+        before = None
+    before_started = getattr(getattr(before, "payload", None), "started_at", None)
+    result = await vehicle.set_climate(_climate_request(temp))
+    payload = getattr(result, "payload", None)
+    rc = getattr(payload, "return_code", None)
+    if rc and rc != "000000":
+        return await set_status(context, f"AC command failed (return code {rc}).")
+    await set_status(context, "Waiting for the car to confirm (up to ~60 s)...")
+    outcome, state, started = await _verify_climate(api, "start", before_started)
+    await set_status(context, _climate_outcome_text("start", temp, outcome, state, started))
+
+
+@handler
 async def cmd_ac_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        await update.message.reply_text(f"Access denied. Your ID: {uid}")
-        return ConversationHandler.END
     await update.message.reply_text(
         "What temperature? (e.g. 22)\nReply a number or /cancel"
     )
     return TEMP_WAIT
 
 
+@handler
 async def receive_temp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        await update.message.reply_text(f"Access denied. Your ID: {uid}")
-        return ConversationHandler.END
     try:
         temp = float(update.message.text)
     except ValueError:
@@ -1241,39 +1536,11 @@ async def receive_temp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send another value or /cancel"
         )
         return TEMP_WAIT
-
-    msg = await update.message.reply_text(f"Setting AC to {temp}°C and starting...")
-    try:
-        await ensure_client()
-        api = client._api
-
-        try:
-            before = await api.get_climate_status(vin)
-        except Exception:
-            before = None
-        before_started = getattr(getattr(before, "payload", None), "started_at", None)
-
-        req = V2RemoteClimateControlRequestModel(
-            command="start",
-            temperature=UnitValueModel(value=temp, unit="C"),
-            save_settings=True,
-        )
-        result = await api.send_climate_control_command(vin, req)
-        payload = getattr(result, "payload", None)
-        rc = getattr(payload, "return_code", None)
-        if rc and rc != "000000":
-            await msg.edit_text(f"AC command failed (return code {rc}).")
-            return ConversationHandler.END
-        await msg.edit_text(
-            "Waiting for the car to confirm (up to ~60 s)..."
-        )
-        outcome, state, started = await _verify_climate(api, "start", before_started)
-        await msg.edit_text(_climate_outcome_text("start", temp, outcome, state, started))
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await _start_climate(update, context, temp)
     return ConversationHandler.END
 
 
+@handler
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
@@ -1349,35 +1616,30 @@ def _climate_outcome_text(action, temp, outcome, state, started):
         )
     if outcome == "ok":
         return "AC stopped (confirmed by the car)."
-    return f"The car did not confirm that the AC stopped (last state: {state}). Check the app."
+    return (
+        f"The car did not confirm that the AC stopped (last state: {state}). "
+        "Check the app."
+    )
 
 
+@handler
 async def cmd_ac_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Stopping AC...")
-    try:
-        await ensure_client()
-        api = client._api
-        req = V2RemoteClimateControlRequestModel(command="stop")
-        result = await api.send_climate_control_command(vin, req)
-        payload = getattr(result, "payload", None)
-        rc = getattr(payload, "return_code", None)
-        if rc and rc != "000000":
-            await msg.edit_text(f"AC stop command failed (return code {rc}).")
-            return
-        await msg.edit_text("Waiting for the car to confirm (up to ~60 s)...")
-        outcome, state, started = await _verify_climate(api, "stop")
-        await msg.edit_text(_climate_outcome_text("stop", None, outcome, state, started))
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Stopping AC...")
+    await get_client()
+    api = _api()
+    vehicle = await get_car()
+    result = await vehicle.set_climate(V2RemoteClimateControlRequestModel(command="stop"))
+    payload = getattr(result, "payload", None)
+    rc = getattr(payload, "return_code", None)
+    if rc and rc != "000000":
+        return await set_status(context, f"AC stop command failed (return code {rc}).")
+    await set_status(context, "Waiting for the car to confirm (up to ~60 s)...")
+    outcome, state, started = await _verify_climate(api, "stop")
+    await set_status(context, _climate_outcome_text("stop", None, outcome, state, started))
 
 
+@handler
 async def cmd_climate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     if not context.args:
         return await update.message.reply_text("Usage: /climate <temp>")
     try:
@@ -1388,119 +1650,61 @@ async def cmd_climate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(
             f"Temperature must be between {TEMP_MIN} and {TEMP_MAX}°C for this vehicle"
         )
-
-    msg = await update.message.reply_text(f"Setting AC to {temp}°C...")
-    try:
-        await ensure_client()
-        api = client._api
-        try:
-            before = await api.get_climate_status(vin)
-        except Exception:
-            before = None
-        before_started = getattr(getattr(before, "payload", None), "started_at", None)
-        req = V2RemoteClimateControlRequestModel(
-            command="start",
-            temperature=UnitValueModel(value=temp, unit="C"),
-            save_settings=True,
-        )
-        result = await api.send_climate_control_command(vin, req)
-        payload = getattr(result, "payload", None)
-        rc = getattr(payload, "return_code", None)
-        if rc and rc != "000000":
-            await msg.edit_text(f"Climate command failed (return code {rc}).")
-            return
-        await msg.edit_text("Waiting for the car to confirm (up to ~60 s)...")
-        outcome, state, started = await _verify_climate(api, "start", before_started)
-        await msg.edit_text(_climate_outcome_text("start", temp, outcome, state, started))
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await _start_climate(update, context, temp)
 
 
+@handler
 async def cmd_refresh_climate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Refreshing climate status...")
-    try:
-        await ensure_client()
-        api = client._api
-        result = await api.refresh_climate_status(vin)
-        await msg.edit_text(f"Climate refresh: {_fmt(result)}")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Refreshing climate status...")
+    vehicle = await get_car()
+    result = await vehicle.refresh_climate_status()
+    await set_status(context, f"Climate refresh: {_fmt(result)}")
 
 
 # ── Battery / Charging ──────────────────────────────────────────────────
 
 
+@handler
 async def cmd_charge_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Setting charge now...")
-    try:
-        await ensure_client()
-        api = client._api
-        cmd = NextChargeSettings(command=ChargeCommandType.CHARGE_NOW)
-        result = await api.send_next_charging_command(vin, cmd)
-        await msg.edit_text(f"Charge now: {_fmt(result)}")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Setting charge now...")
+    vehicle = await get_car()
+    cmd = NextChargeSettings(command=ChargeCommandType.CHARGE_NOW)
+    result = await vehicle.send_next_charging_command(cmd)
+    await set_status(context, f"Charge now: {_fmt(result)}")
 
 
+@handler
 async def cmd_refresh_battery(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Refreshing battery status (may drain 12V)...")
-    try:
-        await ensure_client()
-        api = client._api
-        result = await api.refresh_electric_realtime_status(vin)
-        await msg.edit_text(f"Battery refresh: {_fmt(result)}")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Refreshing battery status (may drain 12V)...")
+    vehicle = await get_car()
+    result = await vehicle.refresh_electric_realtime_status()
+    await set_status(context, f"Battery refresh: {_fmt(result)}")
 
 
 # ── System ──────────────────────────────────────────────────────────────
 
 
+@handler
 async def cmd_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Waking vehicle...")
-    try:
-        await ensure_client()
-        api = client._api
-        result = await api.refresh_vehicle_status(vin)
-        await msg.edit_text(f"Wake: {_fmt(result)}")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Waking vehicle...")
+    vehicle = await get_car()
+    result = await vehicle.refresh_status()
+    await set_status(context, f"Wake: {_fmt(result)}")
 
 
+@handler
 async def cmd_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     if not context.args:
         return await update.message.reply_text("Usage: /alias <name>")
     name = " ".join(context.args)
-    msg = await update.message.reply_text(f"Setting alias to {name}...")
-    try:
-        await ensure_client()
-        car = (await client.get_vehicles())[0]
-        result = await car.set_alias(name)
-        await msg.edit_text(f"Alias set: {result}")
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, f"Setting alias to {name}...")
+    vehicle = await get_car()
+    result = await vehicle.set_alias(name)
+    await set_status(context, f"Alias set: {result}")
 
 
+@handler
 async def cmd_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        await update.message.reply_text(f"Access denied. Your ID: {uid}")
-        return ConversationHandler.END
     if config.get("timezone"):
         await update.message.reply_text(
             f"Note: config.json sets 'timezone' to '{config['timezone']}' and "
@@ -1524,9 +1728,10 @@ async def _apply_timezone(update: Update, name: str) -> int:
     global USER_TZ, TZ_SOURCE
     USER_TZ = ZoneInfo(name)
     TZ_SOURCE = "data/data.json, set via /timezone"
-    data = load_data()
-    data["timezone"] = name
-    save_data(data)
+    async with _data_lock:
+        data = load_data()
+        data["timezone"] = name
+        save_data(data)
     logger.info(f"Timezone set to {name} via /timezone")
     await update.message.reply_text(
         f"Timezone set to {name} — current time: {datetime.now(USER_TZ):%H:%M %d/%m/%Y}",
@@ -1535,6 +1740,7 @@ async def _apply_timezone(update: Update, name: str) -> int:
     return ConversationHandler.END
 
 
+@handler
 async def receive_tz_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     name = _find_timezone(loc.latitude, loc.longitude) if loc else None
@@ -1547,6 +1753,7 @@ async def receive_tz_location(update: Update, context: ContextTypes.DEFAULT_TYPE
     return await _apply_timezone(update, name)
 
 
+@handler
 async def receive_tz_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     try:
@@ -1562,10 +1769,8 @@ async def receive_tz_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Notifications ────────────────────────────────────────────────────────
 
 
+@handler
 async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     data = load_data()
     chat_id = update.effective_chat.id
     if chat_id in data["notify_chats"]:
@@ -1576,10 +1781,8 @@ async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You'll receive app notifications here.")
 
 
+@handler
 async def cmd_unotify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
     data = load_data()
     chat_id = update.effective_chat.id
     if chat_id not in data["notify_chats"]:
@@ -1590,76 +1793,77 @@ async def cmd_unotify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Notifications deactivated for this chat.")
 
 
+@handler
 async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = check_allowed(update)
-    if uid:
-        return await update.message.reply_text(f"Access denied. Your ID: {uid}")
-    msg = await update.message.reply_text("Fetching notifications...")
-    try:
-        car = await get_car()
-        notifs = car.notifications
-        if not notifs:
-            return await msg.edit_text("No notifications.")
-        lines = []
-        for n in notifs[:10]:
-            ds = user_dt(n.date).strftime("%d/%m %H:%M") if n.date else "?"
-            lines.append(f"• [{ds}] {n.message or n.category or n.type}")
-        await msg.edit_text("\n".join(lines))
-    except Exception as e:
-        await msg.edit_text(f"Error: {e}")
+    await progress(update, context, "Fetching notifications...")
+    vehicle = await get_car(only=["notifications"])
+    notifs = vehicle.notifications
+    if not notifs:
+        return await set_status(context, "No notifications.")
+    lines = []
+    for n in notifs[:10]:
+        ds = user_dt(n.date).strftime("%d/%m %H:%M") if n.date else "?"
+        lines.append(f"• [{ds}] {esc(n.message or n.category or n.type)}")
+    await set_status(context, "\n".join(lines))
 
 
 async def poll_notifications(context: ContextTypes.DEFAULT_TYPE):
     try:
-        await ensure_client()
-        vehicles = await client.get_vehicles()
-        car = vehicles[0]
-        await car.update(skip=["status"])
-        notifs = car.notifications
+        vehicle = await get_car(only=["notifications"])
+        notifs = vehicle.notifications
         if not notifs:
             return
 
-        data = load_data()
-        last_str = data.get("last_notification")
-        if last_str:
-            last_dt = datetime.fromisoformat(last_str)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-        else:
-            last_dt = datetime.min.replace(tzinfo=timezone.utc)
+        async with _data_lock:
+            data = load_data()
+            last_str = data.get("last_notification")
+            last_dt = (
+                _aware_utc(datetime.fromisoformat(last_str))
+                if last_str
+                else None
+            ) or datetime.min.replace(tzinfo=timezone.utc)
 
-        new = []
-        for n in notifs:
-            if not n.date:
-                continue
-            nd = n.date
-            if nd.tzinfo is None:
-                nd = nd.replace(tzinfo=timezone.utc)
-            if nd > last_dt:
-                new.append(n)
-        if not new:
-            return
+            new = [n for n in notifs if n.date and _aware_utc(n.date) > last_dt]
+            if not new:
+                return
 
-        data["last_notification"] = max(n.date for n in new).isoformat()
-        save_data(data)
+            data["last_notification"] = max(_aware_utc(n.date) for n in new).isoformat()
+            save_data(data)
 
         for n in new:
             ds = user_dt(n.date).strftime("%d/%m %H:%M") if n.date else "?"
-            text = f"🚗 *{n.category or 'Notification'}*\n{ds}\n{n.message or '—'}"
+            text = f"🚗 *{esc(n.category or 'Notification')}*\n{ds}\n{esc(n.message or '—')}"
             for cid in data.get("notify_chats", []):
                 try:
                     await context.bot.send_message(
-                        chat_id=cid, text=text, parse_mode="Markdown"
+                        chat_id=cid, text=text, parse_mode=ParseMode.MARKDOWN
                     )
-                except Exception as e:
+                except TelegramError as e:
                     logger.warning(f"Notify send fail to {cid}: {e}")
-    except Exception as e:
-        logger.warning(f"Notification poll fail: {e}")
+    except UserError as e:
+        logger.warning(f"Notification poll skipped: {e}")
+    except Exception:
+        logger.exception("Notification poll failed")
 
 
 async def post_init(app: Application):
     app.job_queue.run_repeating(poll_notifications, interval=300, first=30)
     logger.info("Notification polling started (every 5 min)")
+    try:
+        await get_client()
+        logger.info(f"Logged in; controlling VIN {vin}")
+    except UserError as e:
+        logger.error(f"Initial login failed: {e}")
+    except Exception:
+        logger.exception("Initial login failed; will retry on demand")
+
+
+async def post_shutdown(app: Application):
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            logger.warning("Error closing Toyota client")
 
 
 # ── main ────────────────────────────────────────────────────────────────
@@ -1686,15 +1890,16 @@ BUTTON_HANDLERS = {label: HANDLERS[cmd] for label, cmd in BUTTONS if cmd}
 
 
 def main():
-    if not isinstance(ALLOWED_USERS, list) or len(ALLOWED_USERS) == 0:
-        logger.error(
-            "Refusing to start: 'allowed_user_ids' is missing or empty in config.json "
-            "— set at least one allowed Telegram user ID."
-        )
-        sys.exit(1)
     app = (
-        Application.builder().token(TOKEN).post_init(post_init).build()
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
     )
+
+    # Access control runs first for every update.
+    app.add_handler(TypeHandler(Update, access_guard), group=-1)
 
     ac_conv = ConversationHandler(
         entry_points=[
@@ -1721,25 +1926,18 @@ def main():
         entry_points=[
             CommandHandler("trips_summary", cmd_trips_summary),
             MessageHandler(filters.Text("Trips summary"), cmd_trips_summary),
+            CallbackQueryHandler(receive_trips_callback, pattern=r"^trips_"),
         ],
         states={
             PERIOD_WAIT: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Text(ALL_LABELS),
-                    receive_period,
-                )
+                CallbackQueryHandler(receive_trips_callback, pattern=r"^trips_")
             ],
-            DAY_WAIT: [
+            RANGE_WAIT: [
+                CallbackQueryHandler(receive_trips_callback, pattern=r"^trips_"),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND & ~filters.Text(ALL_LABELS),
-                    receive_day,
-                )
-            ],
-            MONTH_WAIT: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Text(ALL_LABELS),
-                    receive_month,
-                )
+                    receive_range,
+                ),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1765,7 +1963,6 @@ def main():
     )
 
     app.add_handler(ac_conv)
-    app.add_handler(CommandHandler("ac_on", cmd_ac_on))
     app.add_handler(trips_conv)
     app.add_handler(tz_conv)
     app.add_handler(CommandHandler("start", cmd_start))

@@ -125,7 +125,7 @@ Options: `--purge`, `--keep-venv`, `--remove-config`, `--remove-data`, `--disabl
 | `/service_history` | Dealer visits |
 | `/trips [n]` | Total km driven `n` days ago (`0` = today, `1` = yesterday, ...) |
 | `/trip` | Alias for `/trips` |
-| `/trips_summary` | Ask for a day or month total (see below) |
+| `/trips_summary` | Day/month totals or a date-range breakdown (see below) |
 | `/last_trip` | Last trip details |
 | `/scores [days]` | Driving scores for the last N days (default 7) |
 | `/summary <d\|w\|m\|y>` | Daily / weekly / monthly / yearly consumption summary |
@@ -169,19 +169,23 @@ Options: `--purge`, `--keep-venv`, `--remove-config`, `--remove-data`, `--disabl
 
 ### `/trips_summary`
 
-Starts a small conversation. The bot asks whether you want **day** or **month** details:
+Starts a small conversation with three buttons:
 
-- **Day**: send a number (`0` = today, `1` = yesterday, ...) or a date in `dd/mm/yyyy`
-- **Month**: send a number `1`–`12` (`1` = January, ..., `12` = December; a month number
-  higher than the current one refers to the previous year)
+- **Day**: pick one of the last 7 days from buttons (`Today`, `Yesterday`, or a date).
+- **Month**: pick the current month or one of the previous 11 months from buttons.
+- **Date range**: type both dates in one message, `dd/mm/yyyy - dd/mm/yyyy`
+  (e.g. `01/10/2026 - 15/10/2026`). Ranges are limited to 365 days.
 
-The bot replies with the number of trips and total km (and EV-only km) for that period.
+Day and month replies show the number of trips and total km (and EV-only km). A date
+range shows the km driven on every day in the range, including days with `0.0 km`, plus
+the range total and EV-only km. Long ranges are split across multiple messages.
 
 ## Keyboard
 
 Run `/start` or `/help` to show a persistent keyboard. Every command is available as a
 button, so you never have to type `/command`. Buttons that need input (`AC On`,
-`Trips summary`) ask a follow-up question.
+`Trips summary`) ask a follow-up question; `Trips summary` uses buttons for day and
+month and only asks you to type the two dates for a custom range.
 
 ## Getting a Telegram bot token (step by step, no experience needed)
 
